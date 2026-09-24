@@ -1,0 +1,11 @@
+[
+  {
+    "address": "7ga6rtE9qSb3wdEiDCpTu2kHqoGVfT52jD8ign1rYTvx",
+    "symbol": "xHYPE",
+    "target": {
+      "price": 2.81,
+      "direction": "above"
+    },
+    "pings": 5
+  }
+]
