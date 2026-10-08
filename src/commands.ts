@@ -2,6 +2,7 @@ import type { AppConfig, Direction, FiredState, WatchItem } from "./types";
 import type { WatchStore } from "./store";
 import { getTokenInfo } from "./gmgn";
 import { formatPrice, isHit } from "./alerts";
+import { analyzePositionInput } from "./position";
 
 const CHAIN = "sol";
 
@@ -11,6 +12,7 @@ export interface CommandContext {
   state: FiredState;
   saveState: (state: FiredState) => void;
   reply: (text: string) => Promise<void>;
+  replyLong: (text: string) => Promise<void>;
 }
 
 export interface BotCommand {
@@ -19,6 +21,7 @@ export interface BotCommand {
 }
 
 export const BOT_COMMANDS: BotCommand[] = [
+  { command: "pos", description: "Analyse an LP position + top wallets: /pos <position|pool> [wallet|pool]" },
   { command: "add", description: "Track a mint: /add <mint> <target> [above|below]" },
   { command: "list", description: "Show tracked mints with live price + status" },
   { command: "remove", description: "Stop tracking a mint: /remove <mint>" },
@@ -30,6 +33,10 @@ export const BOT_COMMANDS: BotCommand[] = [
 
 const HELP = [
   "tokenWatcher commands:",
+  "/pos <position|pool> [wallet|pool]  — analyse your LP + scan the pool's top wallets",
+  "     e.g. /pos <positionAddress> <poolAddress>",
+  "     e.g. /pos <poolAddress> <walletAddress>",
+  "     e.g. /pos https://app.meteora.ag/dlmm/<pool>",
   "/add <mint> <target> [above|below]  — track a mint (default: above)",
   "/list  — tracked mints with live price + status",
   "/remove <mint>  — stop tracking a mint",
@@ -58,7 +65,7 @@ function forgetFiredStates(state: FiredState, address: string): number {
 }
 
 export async function handleCommand(text: string, ctx: CommandContext): Promise<void> {
-  const { config, store, state, saveState, reply } = ctx;
+  const { config, store, state, saveState, reply, replyLong } = ctx;
   const trimmed = (text ?? "").trim();
   if (!trimmed.startsWith("/")) return;
 
@@ -70,6 +77,31 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
     case "/help":
       await reply(HELP);
       return;
+
+    case "/pos": {
+      const input = args.join(" ").trim();
+      if (!input) {
+        await reply(
+          "Usage: /pos <position|pool> [wallet|pool]\n" +
+            "Examples:\n" +
+            "  /pos <positionAddress> <poolAddress>\n" +
+            "  /pos <poolAddress> <walletAddress>\n" +
+            "  /pos https://app.meteora.ag/dlmm/<pool>",
+        );
+        return;
+      }
+      await reply("🔎 Analysing position + scanning pool wallets… (this can take ~20-40s)");
+      try {
+        const sections = await analyzePositionInput(input, {
+          rpcUrl: config.solanaRpcUrl,
+          topWallets: config.posTopWallets,
+        });
+        await replyLong(sections.join("\n\n"));
+      } catch (err) {
+        await reply(`Position analysis failed: ${(err as Error).message}`);
+      }
+      return;
+    }
 
     case "/add": {
       if (args.length < 2) {

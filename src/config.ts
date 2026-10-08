@@ -23,6 +23,11 @@ function positiveInt(name: string, fallback: number): number {
   return Math.floor(value);
 }
 
+function optional(name: string, fallback: string): string {
+  const raw = process.env[name];
+  return raw && raw.trim() ? raw.trim() : fallback;
+}
+
 export function parseWatchItem(raw: unknown, index: number): WatchItem {
   const item = raw as Record<string, unknown>;
   if (!item || typeof item !== "object") {
@@ -79,5 +84,7 @@ export function loadConfig(): AppConfig {
     pollIntervalMs: positiveInt("POLL_INTERVAL_MS", 15000),
     pingCount: positiveInt("PING_COUNT", 5),
     pingDelayMs: positiveInt("PING_DELAY_MS", 1000),
+    solanaRpcUrl: optional("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com"),
+    posTopWallets: positiveInt("POS_TOP_WALLETS", 15),
   };
 }

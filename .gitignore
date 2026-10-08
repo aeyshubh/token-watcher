@@ -4,5 +4,6 @@ dist/
 .env.*
 !.env.example
 state.json
+scout-state.json
 *.log
 .DS_Store

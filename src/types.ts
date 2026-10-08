@@ -19,6 +19,8 @@ export interface AppConfig {
   pollIntervalMs: number;
   pingCount: number;
   pingDelayMs: number;
+  solanaRpcUrl: string;
+  posTopWallets: number;
 }
 
 export interface FiredRecord {

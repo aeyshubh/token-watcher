@@ -1,10 +1,11 @@
 import { loadConfig } from "./config";
 import { getTokenInfo } from "./gmgn";
-import { sendMessage, getUpdates, setMyCommands } from "./telegram";
+import { sendMessage, sendLongMessage, getUpdates, setMyCommands } from "./telegram";
 import { loadState, saveState } from "./state";
 import { formatAlert, formatPrice, isHit, targetKey } from "./alerts";
 import { WatchStore } from "./store";
 import { handleCommand, BOT_COMMANDS } from "./commands";
+import { loadScoutConfig, startScout, type ScoutHandle } from "./scout";
 import type { AppConfig, FiredState } from "./types";
 
 const CHAIN = "sol";
@@ -89,9 +90,12 @@ async function main(): Promise<void> {
   const store = new WatchStore();
   const state = loadState();
 
+  const scoutEnabled = (process.env.SCOUT_ENABLED ?? "true").toLowerCase() !== "false";
+
   log(
     `tokenWatcher started · poll=${config.pollIntervalMs}ms · ` +
-      `tokens=${store.count()} · chat=${config.telegramChatId}`,
+      `tokens=${store.count()} · chat=${config.telegramChatId} · ` +
+      `scout=${scoutEnabled ? "on" : "off"}`,
   );
 
   try {
@@ -101,6 +105,20 @@ async function main(): Promise<void> {
     log(`could not register command menu: ${(err as Error).message}`);
   }
 
+  let scout: ScoutHandle | undefined;
+  if (scoutEnabled) {
+    try {
+      scout = startScout(
+        loadScoutConfig({
+          botToken: config.telegramBotToken,
+          chatId: config.telegramChatId,
+        }),
+      );
+    } catch (err) {
+      log(`could not start scout: ${(err as Error).message}`);
+    }
+  }
+
   let running = true;
   const timers: NodeJS.Timeout[] = [];
 
@@ -108,6 +126,7 @@ async function main(): Promise<void> {
     if (!running) return;
     running = false;
     log(`received ${signal}, shutting down`);
+    scout?.stop();
     for (const timer of timers) clearTimeout(timer);
     setTimeout(() => process.exit(0), 50);
   };
@@ -116,6 +135,9 @@ async function main(): Promise<void> {
 
   const reply = (text: string): Promise<void> =>
     sendMessage(config.telegramBotToken, config.telegramChatId, text);
+
+  const replyLong = (text: string): Promise<void> =>
+    sendLongMessage(config.telegramBotToken, config.telegramChatId, text);
 
   const runPriceLoop = async (): Promise<void> => {
     try {
@@ -135,7 +157,7 @@ async function main(): Promise<void> {
           offset = update.updateId + 1;
           if (String(update.chatId) !== config.telegramChatId) continue;
           try {
-            await handleCommand(update.text, { config, store, state, saveState, reply });
+            await handleCommand(update.text, { config, store, state, saveState, reply, replyLong });
           } catch (err) {
             log(`command error: ${(err as Error).message}`);
           }

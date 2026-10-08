@@ -65,6 +65,36 @@ export async function sendMessage(
   });
 }
 
+/** Split text into <= limit chunks on line boundaries (Telegram caps at 4096). */
+export function splitMessage(text: string, limit = 3900): string[] {
+  if (text.length <= limit) return [text];
+  const chunks: string[] = [];
+  let current = "";
+  for (const line of text.split("\n")) {
+    if (current.length + line.length + 1 > limit && current) {
+      chunks.push(current);
+      current = "";
+    }
+    if (line.length > limit) {
+      for (let i = 0; i < line.length; i += limit) chunks.push(line.slice(i, i + limit));
+      continue;
+    }
+    current = current ? `${current}\n${line}` : line;
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+export async function sendLongMessage(
+  botToken: string,
+  chatId: string,
+  text: string,
+): Promise<void> {
+  for (const chunk of splitMessage(text)) {
+    await sendMessage(botToken, chatId, chunk);
+  }
+}
+
 export interface TelegramChat {
   chat_id: number;
   type: string;

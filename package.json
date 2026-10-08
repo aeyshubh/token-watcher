@@ -11,8 +11,12 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "get-chat-id": "tsx scripts/get-chat-id.ts",
     "test-alert": "tsx scripts/test-alert.ts",
+    "test-pos": "tsx scripts/test-pos.ts",
     "set-commands": "tsx scripts/set-commands.ts",
-    "reset": "tsx scripts/reset-state.ts"
+    "reset": "tsx scripts/reset-state.ts",
+    "reset-scout": "tsx scripts/reset-scout.ts",
+    "scout": "tsx src/scout.ts",
+    "test-scout": "tsx scripts/test-scout.ts"
   },
   "dependencies": {
     "dotenv": "^16.4.5"
