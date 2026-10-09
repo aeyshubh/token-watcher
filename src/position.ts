@@ -26,6 +26,7 @@ export interface ResolvedTarget {
   pool?: string;
   owner?: string;
   position?: string;
+  poolDetail?: MeteoraPoolDetail;
 }
 
 // ---------------------------------------------------------------------------
@@ -103,6 +104,7 @@ export async function resolveTarget(
     const pool = await fetchPool(candidate);
     if (pool) {
       result.pool = candidate;
+      result.poolDetail = pool;
       break;
     }
   }
@@ -373,7 +375,7 @@ export async function analyzePositionInput(
     ];
   }
 
-  const pool = await fetchPool(target.pool);
+  const pool = target.poolDetail ?? (await fetchPool(target.pool));
   if (!pool) return [`Pool ${target.pool} not found on Meteora DLMM.`];
 
   const sections: string[] = [buildPoolHealth(pool).join("\n")];

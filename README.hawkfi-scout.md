@@ -41,6 +41,7 @@ SCOUT_MIN_MARKET_CAP=1000000   # base-token mcap floor (USD)
 SCOUT_MIN_FEES_1H=2000         # 1h fees floor (USD)
 SCOUT_MIN_TVL=50000            # TVL floor (USD)
 SCOUT_MIN_VOLUME_30M=100000    # 30m volume floor (USD)
+SCOUT_MIN_ALERT_INTERVAL_MS=60000 # re-alert the same pool after 1 min (0 = once, ever)
 SCOUT_MAX_RESULTS=100          # pools pulled per scan
 ```
 

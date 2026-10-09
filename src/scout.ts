@@ -22,6 +22,7 @@ export interface ScoutConfig {
   minTvl: number;
   minVolume30m: number;
   maxResults: number;
+  minAlertIntervalMs: number;
 }
 
 export interface PoolMatch {
@@ -65,6 +66,7 @@ export function loadScoutConfig(
     minTvl: numberEnv("SCOUT_MIN_TVL", 50000),
     minVolume30m: numberEnv("SCOUT_MIN_VOLUME_30M", 100000),
     maxResults: numberEnv("SCOUT_MAX_RESULTS", 100),
+    minAlertIntervalMs: numberEnv("SCOUT_MIN_ALERT_INTERVAL_MS", 60000, true),
   };
 }
 
@@ -109,7 +111,7 @@ export function formatPoolAlert({ pool, base }: PoolMatch): string {
     `${pool.name} · MC ${formatUsd(Number(base.market_cap ?? 0))}`,
     `TVL ${formatUsd(pool.tvl)} · 30m Vol ${formatUsd(pool.volume["30m"])} · 1h Fees ${formatUsd(pool.fees["1h"])}`,
     `Pool: ${pool.address}`,
-    `https://app.meteora.ag/dlmm/${pool.address}`,
+    `https://www.hawkfi.ag/meteora/${pool.address}?create=true`,
   ].join("\n");
 }
 
@@ -142,9 +144,18 @@ export async function scanOnce(
 
     if (!send) continue;
 
-    if (state?.[pool.address]) {
-      log(`already alerted: ${pool.name} (fired once)`);
-      continue;
+    const lastAlert = state?.[pool.address];
+    if (lastAlert) {
+      if (config.minAlertIntervalMs <= 0) {
+        log(`already alerted: ${pool.name} (fired once)`);
+        continue;
+      }
+      const elapsed = Date.now() - new Date(lastAlert.firedAt).getTime();
+      if (elapsed < config.minAlertIntervalMs) {
+        const left = Math.ceil((config.minAlertIntervalMs - elapsed) / 1000);
+        log(`cooldown: ${pool.name} (${left}s left)`);
+        continue;
+      }
     }
 
     try {
@@ -153,7 +164,10 @@ export async function scanOnce(
         state[pool.address] = { firedAt: new Date().toISOString() };
         saveState?.(state);
       }
-      log(`alert sent: ${pool.name} (will not alert again)`);
+      log(
+        `alert sent: ${pool.name} ` +
+          `(${config.minAlertIntervalMs > 0 ? `re-alerts after ${Math.round(config.minAlertIntervalMs / 1000)}s` : "will not alert again"})`,
+      );
     } catch (err) {
       log(`telegram send failed for ${pool.name}: ${(err as Error).message}`);
     }
@@ -184,7 +198,8 @@ export function startScout(
     `HawkFi scout started · interval=${config.intervalMs}ms · chat=${config.chatId} · ` +
       `MC>${formatUsd(config.minMarketCap)} · fees1h>${formatUsd(config.minFees1h)} · ` +
       `TVL>${formatUsd(config.minTvl)} · vol30m>${formatUsd(config.minVolume30m)} · ` +
-      `fire-once (${Object.keys(state).length} pool(s) already alerted)`,
+      `${config.minAlertIntervalMs > 0 ? `re-alert every ${Math.round(config.minAlertIntervalMs / 1000)}s` : "fire-once"} ` +
+      `(${Object.keys(state).length} pool(s) already alerted)`,
   );
 
   let running = true;
