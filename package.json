@@ -4,6 +4,7 @@
   "private": true,
   "description": "Watches Solana token prices via GMGN OpenAPI and alerts on Telegram when target levels are hit.",
   "type": "commonjs",
+  "main": "dist/index.js",
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
