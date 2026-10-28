@@ -2,7 +2,7 @@
 
 A Telegram bot that watches Solana token prices via the [GMGN OpenAPI](https://gmgn.ai/ai), alerts when a target is hit, and analyses Meteora DLMM LP positions with a `/pos` command.
 
-> The HawkFi pool scout (scans Meteora pools for TVL/fees/volume) now runs **in-process** with the price bot by default — no second process needed. Set `SCOUT_ENABLED=false` to disable. Details: [`README.hawkfi-scout.md`](./README.hawkfi-scout.md).
+> The HawkFi pool scout (scans Meteora pools, checks base-token 5m volume + market cap via GMGN) runs **in-process** with the price bot by default — no second process needed. Its selection criteria live in **`config/selection.json`**. Set `SCOUT_ENABLED=false` to disable. Details: [`README.hawkfi-scout.md`](./README.hawkfi-scout.md).
 
 ## Quick start
 
@@ -74,6 +74,7 @@ TELEGRAM_CHAT_ID=123456789
 POLL_INTERVAL_MS=15000   # price poll interval
 PING_COUNT=5             # messages per target hit
 PING_DELAY_MS=1000       # gap between pings
+GMGN_MIN_INTERVAL_MS=1000 # min gap between GMGN calls (price loop + scout share it)
 
 SOLANA_RPC_URL=https://api.mainnet-beta.solana.com  # dedicated RPC = faster /pos scans
 POS_TOP_WALLETS=15                                  # LPs to scan per pool
@@ -84,6 +85,8 @@ POS_TOP_WALLETS=15                                  # LPs to scan per pool
 ```json
 [{ "address": "<mint>", "symbol": "xHYPE", "target": { "price": 2.75, "direction": "above" }, "pings": 5 }]
 ```
+
+`config/selection.json` holds the scout's pool/token selection criteria (the only place they are defined) — see [`README.hawkfi-scout.md`](./README.hawkfi-scout.md#selection-criteria--configselectionjson).
 
 ## Running
 
@@ -124,7 +127,9 @@ src/
   meteora.ts    # Meteora DLMM API client
   solana.ts     # Solana RPC + PositionV2 decoding
   position.ts   # /pos analysis engine + top-wallet scan
-  hawkfi.ts     # pool scout client
+  hawkfi.ts     # pool scout Meteora client (pools + SOL/USD)
+  selection.ts  # loads/validates config/selection.json, builds the Meteora filter
+  scout.ts      # pool scout loop (Meteora filters + GMGN 5m volume / market cap)
   telegram.ts   # sendMessage + long-poll
   store.ts / state.ts / alerts.ts / config.ts / types.ts
 scripts/        # get-chat-id, test-alert, test-pos, set-commands, reset, scout
@@ -138,6 +143,7 @@ scripts/        # get-chat-id, test-alert, test-pos, set-commands, reset, scout
 | Bot ignores commands | Must be running, and message from the chat in `TELEGRAM_CHAT_ID`. |
 | `/add` "Could not fetch mint" | Bad address or no GMGN price. |
 | `401`/`403` from GMGN | Disable IPv6 or verify `GMGN_API_KEY`. |
+| `GMGN rate-limited until …` | Free-tier limit; calls pause until reset. Raise `GMGN_MIN_INTERVAL_MS`. |
 | `/pos` slow or empty wallets | Use a dedicated `SOLANA_RPC_URL`; large pools take longer. |
 | Target won't re-fire | It fires once — `/remove` + `/add`, or `npm run reset`. |
 

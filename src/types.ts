@@ -37,3 +37,10 @@ export interface TokenInfo {
   price: number;
   liquidity: number;
 }
+
+export interface TokenStats extends TokenInfo {
+  marketCap: number;
+  volume5m: number;
+  volume1h: number;
+  volume24h: number;
+}

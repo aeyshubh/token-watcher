@@ -400,5 +400,6 @@ export async function analyzePositionInput(
   }
 
   sections.push((await buildTopWallets(pool.address, options, now)).join("\n"));
+  sections.push(`🔗 Market positions: https://solscan.io/account/${pool.address}#market_positions`);
   return sections;
 }

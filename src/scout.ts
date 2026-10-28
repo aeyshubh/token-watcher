@@ -1,33 +1,49 @@
 import "dotenv/config";
-import { fetchPools, type MeteoraPool, type MeteoraToken } from "./hawkfi";
+import { fetchPools, fetchSolUsd, type MeteoraPool, type MeteoraToken } from "./hawkfi";
+import { getTokenStats } from "./gmgn";
 import { sendMessage } from "./telegram";
+import {
+  buildPoolFilter,
+  describeSelection,
+  loadSelection,
+  needsSolPrice,
+  type SelectionCriteria,
+} from "./selection";
 import {
   loadScoutState,
   saveScoutState,
   type ScoutState,
 } from "./scout-state";
+import type { TokenStats } from "./types";
 
-const QUOTE_MINTS = new Set([
-  "So11111111111111111111111111111111111111112", // SOL
-  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
-  "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // USDT
-]);
+/** GMGN calls are serialized/throttled in gmgn.ts; this only bounds in-flight promises. */
+const GMGN_CONCURRENCY = 2;
+/** Reuse a token's GMGN stats across scans for this long (5m volume tolerates ~30s staleness). */
+const TOKEN_STATS_TTL_MS = 30_000;
+const statsCache = new Map<string, { stats: TokenStats; at: number }>();
 
+/** Runtime settings come from .env; all selection criteria come from config/selection.json. */
 export interface ScoutConfig {
   botToken: string;
   chatId: string;
+  gmgnApiKey: string;
   intervalMs: number;
-  minMarketCap: number;
-  minFees1h: number;
-  minTvl: number;
-  minVolume30m: number;
-  maxResults: number;
   minAlertIntervalMs: number;
+  selection: SelectionCriteria;
 }
 
 export interface PoolMatch {
   pool: MeteoraPool;
   base: MeteoraToken;
+  token: TokenStats;
+  solUsd: number | null;
+}
+
+export interface ScanResult {
+  matches: PoolMatch[];
+  /** Pools that passed Meteora's server-side filters (before GMGN checks). */
+  candidates: number;
+  rejected: { pool: MeteoraPool; reason: string }[];
 }
 
 export function log(message: string): void {
@@ -55,45 +71,102 @@ function numberEnv(name: string, fallback: number, allowZero = false): number {
 }
 
 export function loadScoutConfig(
-  overrides: Partial<Pick<ScoutConfig, "botToken" | "chatId">> = {},
+  overrides: Partial<Pick<ScoutConfig, "botToken" | "chatId" | "gmgnApiKey">> = {},
 ): ScoutConfig {
   return {
     botToken: overrides.botToken ?? required("TELEGRAM_BOT_TOKEN"),
     chatId: overrides.chatId ?? required("TELEGRAM_CHAT_ID"),
+    gmgnApiKey: overrides.gmgnApiKey ?? required("GMGN_API_KEY"),
     intervalMs: numberEnv("SCOUT_INTERVAL_MS", 15000),
-    minMarketCap: numberEnv("SCOUT_MIN_MARKET_CAP", 1000000),
-    minFees1h: numberEnv("SCOUT_MIN_FEES_1H", 2000),
-    minTvl: numberEnv("SCOUT_MIN_TVL", 50000),
-    minVolume30m: numberEnv("SCOUT_MIN_VOLUME_30M", 100000),
-    maxResults: numberEnv("SCOUT_MAX_RESULTS", 100),
     minAlertIntervalMs: numberEnv("SCOUT_MIN_ALERT_INTERVAL_MS", 60000, true),
+    selection: loadSelection(),
   };
 }
 
-function pickBaseToken(pool: MeteoraPool): MeteoraToken | null {
-  const xQuote = QUOTE_MINTS.has(pool.token_x.address);
-  const yQuote = QUOTE_MINTS.has(pool.token_y.address);
+function pickBaseToken(pool: MeteoraPool, quoteMints: Set<string>): MeteoraToken | null {
+  const xQuote = quoteMints.has(pool.token_x.address);
+  const yQuote = quoteMints.has(pool.token_y.address);
   if (xQuote && yQuote) return null;
   return xQuote ? pool.token_y : pool.token_x;
 }
 
-export function evaluatePools(pools: MeteoraPool[], config: ScoutConfig): PoolMatch[] {
-  const matches: PoolMatch[] = [];
-  for (const pool of pools) {
-    const base = pickBaseToken(pool);
-    if (!base) continue;
-
-    const marketCap = Number(base.market_cap ?? 0);
-    if (
-      marketCap > config.minMarketCap &&
-      pool.tvl > config.minTvl &&
-      pool.volume["30m"] > config.minVolume30m &&
-      pool.fees["1h"] > config.minFees1h
-    ) {
-      matches.push({ pool, base });
-    }
+/** GMGN-side criteria (token-wide). Returns a rejection reason, or null if the token passes. */
+export function checkToken(token: TokenStats, criteria: SelectionCriteria): string | null {
+  if (!(token.marketCap > criteria.minMarketCapUsd)) {
+    return `MC ${formatUsd(token.marketCap)} ≤ ${formatUsd(criteria.minMarketCapUsd)}`;
   }
-  return matches;
+  if (!(token.volume5m > criteria.minVolume5mUsd)) {
+    return `5m vol ${formatUsd(token.volume5m)} ≤ ${formatUsd(criteria.minVolume5mUsd)}`;
+  }
+  return null;
+}
+
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const index = next;
+      next += 1;
+      results[index] = await fn(items[index]);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+export async function evaluatePools(
+  pools: MeteoraPool[],
+  config: ScoutConfig,
+  solUsd: number | null,
+): Promise<ScanResult> {
+  const quoteMints = new Set(config.selection.quoteMints);
+  const rejected: ScanResult["rejected"] = [];
+  const withBase: { pool: MeteoraPool; base: MeteoraToken }[] = [];
+
+  for (const pool of pools) {
+    const base = pickBaseToken(pool, quoteMints);
+    if (!base) {
+      rejected.push({ pool, reason: "both sides are quote mints" });
+      continue;
+    }
+    withBase.push({ pool, base });
+  }
+
+  // One GMGN lookup per unique base token, cached briefly across scans.
+  const addresses = [...new Set(withBase.map((c) => c.base.address))];
+  const lookups = await mapLimit(addresses, GMGN_CONCURRENCY, async (address) => {
+    const cached = statsCache.get(address);
+    if (cached && Date.now() - cached.at < TOKEN_STATS_TTL_MS) return { address, stats: cached.stats };
+    try {
+      const stats = await getTokenStats(config.gmgnApiKey, config.selection.chain, address);
+      statsCache.set(address, { stats, at: Date.now() });
+      return { address, stats };
+    } catch (err) {
+      return { address, error: (err as Error).message };
+    }
+  });
+  for (const [address, entry] of statsCache) {
+    if (Date.now() - entry.at >= TOKEN_STATS_TTL_MS) statsCache.delete(address);
+  }
+  const byAddress = new Map(lookups.map((l) => [l.address, l]));
+
+  const matches: PoolMatch[] = [];
+  for (const { pool, base } of withBase) {
+    const lookup = byAddress.get(base.address);
+    if (!lookup || !("stats" in lookup) || !lookup.stats) {
+      rejected.push({ pool, reason: `GMGN lookup failed: ${lookup && "error" in lookup ? lookup.error : "unknown"}` });
+      continue;
+    }
+    const reason = checkToken(lookup.stats, config.selection);
+    if (reason) {
+      rejected.push({ pool, reason });
+      continue;
+    }
+    matches.push({ pool, base, token: lookup.stats, solUsd });
+  }
+
+  return { matches, candidates: pools.length, rejected };
 }
 
 export function formatUsd(value: number): string {
@@ -105,42 +178,83 @@ export function formatUsd(value: number): string {
   return `$${value.toFixed(0)}`;
 }
 
-export function formatPoolAlert({ pool, base }: PoolMatch): string {
+function formatAge(createdAtMs: number | undefined): string {
+  if (!createdAtMs || !Number.isFinite(createdAtMs)) return "n/a";
+  const hours = (Date.now() - createdAtMs) / 3_600_000;
+  if (hours < 1) return `${Math.round(hours * 60)}m`;
+  if (hours < 48) return `${hours.toFixed(1)}h`;
+  return `${(hours / 24).toFixed(1)}d`;
+}
+
+function poolFees(pool: MeteoraPool, window: SelectionCriteria["minFees"]["window"]): number {
+  const value = (pool.fees as unknown as Record<string, number | undefined>)[window];
+  return typeof value === "number" ? value : NaN;
+}
+
+export function formatPoolAlert(match: PoolMatch, criteria: SelectionCriteria): string {
+  const { pool, token, solUsd } = match;
+  const window = criteria.minFees.window;
+  const fees = poolFees(pool, window);
+  const feesSol = solUsd && Number.isFinite(fees) ? ` (~${(fees / solUsd).toFixed(1)} SOL)` : "";
+  const ratio = pool.fee_tvl_ratio?.["1h"];
+
   return [
     "🟢 HawkFi pool match",
-    `${pool.name} · MC ${formatUsd(Number(base.market_cap ?? 0))}`,
-    `TVL ${formatUsd(pool.tvl)} · 30m Vol ${formatUsd(pool.volume["30m"])} · 1h Fees ${formatUsd(pool.fees["1h"])}`,
+    `${pool.name} · MC ${formatUsd(token.marketCap)}`,
+    `TVL ${formatUsd(pool.tvl)} · 5m Vol ${formatUsd(token.volume5m)} (token, GMGN)`,
+    `${window} Fees ${formatUsd(fees)}${feesSol} · Fee/TVL 1h ${typeof ratio === "number" ? `${ratio.toFixed(3)}%` : "n/a"} · age ${formatAge(pool.created_at)}`,
     `Pool: ${pool.address}`,
     `https://www.hawkfi.ag/meteora/${pool.address}?create=true`,
   ].join("\n");
+}
+
+function summarize(match: PoolMatch, criteria: SelectionCriteria): string {
+  const { pool, token } = match;
+  return (
+    `${pool.name} · MC ${formatUsd(token.marketCap)} · TVL ${formatUsd(pool.tvl)} · ` +
+    `5m Vol ${formatUsd(token.volume5m)} · ${criteria.minFees.window} Fees ${formatUsd(poolFees(pool, criteria.minFees.window))}`
+  );
 }
 
 export async function scanOnce(
   config: ScoutConfig,
   options: {
     send?: boolean;
+    verbose?: boolean;
     state?: ScoutState;
     saveState?: (state: ScoutState) => void;
   } = {},
-): Promise<PoolMatch[]> {
-  const { send = true, state, saveState } = options;
+): Promise<ScanResult> {
+  const { send = true, verbose = false, state, saveState } = options;
+  const criteria = config.selection;
+
+  const solUsd = needsSolPrice(criteria) ? await fetchSolUsd(criteria.solUsdPool) : null;
+  const filter = buildPoolFilter(criteria, solUsd);
+  if (verbose) {
+    log(`SOL/USD ${solUsd ?? "n/a"} · filter_by: ${filter}`);
+  }
 
   const pools = await fetchPools({
-    minTvl: config.minTvl,
-    minVolume30m: config.minVolume30m,
-    minFees1h: config.minFees1h,
-    pageSize: config.maxResults,
+    filter,
+    sortBy: criteria.sortBy,
+    pageSize: criteria.pageSize,
   });
 
-  const matches = evaluatePools(pools, config);
+  const result = await evaluatePools(pools, config, solUsd);
 
-  for (const match of matches) {
-    const { pool, base } = match;
-    const mcap = formatUsd(Number(base.market_cap ?? 0));
-    log(
-      `match ${pool.name} · MC ${mcap} · TVL ${formatUsd(pool.tvl)} · ` +
-        `30m Vol ${formatUsd(pool.volume["30m"])} · 1h Fees ${formatUsd(pool.fees["1h"])}`,
-    );
+  if (verbose) {
+    log(`${result.candidates} pool(s) passed Meteora filters`);
+    for (const { pool, reason } of result.rejected) log(`rejected ${pool.name}: ${reason}`);
+  } else {
+    const gmgnFailures = result.rejected.filter((r) => r.reason.startsWith("GMGN lookup failed"));
+    if (gmgnFailures.length > 0) {
+      log(`GMGN unavailable for ${gmgnFailures.length} candidate(s): ${gmgnFailures[0].reason}`);
+    }
+  }
+
+  for (const match of result.matches) {
+    const { pool } = match;
+    log(`match ${summarize(match, criteria)}`);
 
     if (!send) continue;
 
@@ -159,7 +273,7 @@ export async function scanOnce(
     }
 
     try {
-      await sendMessage(config.botToken, config.chatId, formatPoolAlert(match));
+      await sendMessage(config.botToken, config.chatId, formatPoolAlert(match, criteria));
       if (state) {
         state[pool.address] = { firedAt: new Date().toISOString() };
         saveState?.(state);
@@ -173,7 +287,7 @@ export async function scanOnce(
     }
   }
 
-  return matches;
+  return result;
 }
 
 export interface ScoutHandle {
@@ -196,8 +310,7 @@ export function startScout(
 
   log(
     `HawkFi scout started · interval=${config.intervalMs}ms · chat=${config.chatId} · ` +
-      `MC>${formatUsd(config.minMarketCap)} · fees1h>${formatUsd(config.minFees1h)} · ` +
-      `TVL>${formatUsd(config.minTvl)} · vol30m>${formatUsd(config.minVolume30m)} · ` +
+      `${describeSelection(config.selection)} · ` +
       `${config.minAlertIntervalMs > 0 ? `re-alert every ${Math.round(config.minAlertIntervalMs / 1000)}s` : "fire-once"} ` +
       `(${Object.keys(state).length} pool(s) already alerted)`,
   );
@@ -209,10 +322,10 @@ export function startScout(
   const loop = async (): Promise<void> => {
     const started = Date.now();
     try {
-      const matches = await scanOnce(config, { send: true, state, saveState });
+      const { matches, candidates } = await scanOnce(config, { send: true, state, saveState });
       scanCount += 1;
       if (matches.length === 0 && scanCount % 20 === 0) {
-        log(`heartbeat · ${scanCount} scans · no matches yet`);
+        log(`heartbeat · ${scanCount} scans · no matches yet (${candidates} Meteora candidate(s) last scan)`);
       }
     } catch (err) {
       log(`tick error: ${(err as Error).message}`);

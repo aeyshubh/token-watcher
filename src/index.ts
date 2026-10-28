@@ -112,6 +112,7 @@ async function main(): Promise<void> {
         loadScoutConfig({
           botToken: config.telegramBotToken,
           chatId: config.telegramChatId,
+          gmgnApiKey: config.gmgnApiKey,
         }),
       );
     } catch (err) {

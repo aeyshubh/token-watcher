@@ -1,0 +1,22 @@
+{
+  "chain": "sol",
+  "quoteMints": [
+    "So11111111111111111111111111111111111111112",
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+  ],
+  "minMarketCapUsd": 2000000,
+  "minTvlUsd": 60000,
+  "minVolume5mUsd": 100000,
+  "minFeeTvlRatio1h": 0.05,
+  "minPoolAgeSeconds": 3600,
+  "minFees": {
+    "amount": 50,
+    "unit": "SOL",
+    "window": "24h"
+  },
+  "sortBy": "fee_24h:desc",
+  "pageSize": 100,
+  "solUsdPool": "5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6",
+  "extraFilters": []
+}
