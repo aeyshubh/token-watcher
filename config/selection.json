@@ -7,7 +7,7 @@
   ],
   "minMarketCapUsd": 2000000,
   "minTvlUsd": 60000,
-  "minVolume5mUsd": 100000,
+  "minVolume5mUsd": 50000,
   "minFeeTvlRatio1h": 0.05,
   "minPoolAgeSeconds": 3600,
   "minFees": {
