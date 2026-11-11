@@ -3,7 +3,7 @@ dist/
 .env
 .env.*
 !.env.example
-state.json
-scout-state.json
+lp-state.json
+close-state.json
 *.log
 .DS_Store

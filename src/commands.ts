@@ -1,18 +1,13 @@
-import type { AppConfig, Direction, FiredState, WatchItem } from "./types";
-import type { WatchStore } from "./store";
-import { getTokenInfo } from "./gmgn";
-import { formatPrice, isHit } from "./alerts";
-import { analyzePositionInput } from "./position";
-
-const CHAIN = "sol";
+import { formatUsd } from "./format";
+import { isBase58 } from "./solana";
+import { formatPositionStatus, type LpTarget, type LpTrackerHandle } from "./lp";
+import type { CloseExecutorHandle } from "./executor";
 
 export interface CommandContext {
-  config: AppConfig;
-  store: WatchStore;
-  state: FiredState;
-  saveState: (state: FiredState) => void;
   reply: (text: string) => Promise<void>;
   replyLong: (text: string) => Promise<void>;
+  lp?: LpTrackerHandle;
+  close?: CloseExecutorHandle;
 }
 
 export interface BotCommand {
@@ -21,51 +16,192 @@ export interface BotCommand {
 }
 
 export const BOT_COMMANDS: BotCommand[] = [
-  { command: "pos", description: "Analyse an LP position + top wallets: /pos <position|pool> [wallet|pool]" },
-  { command: "add", description: "Track a mint: /add <mint> <target> [above|below]" },
-  { command: "list", description: "Show tracked mints with live price + status" },
-  { command: "remove", description: "Stop tracking a mint: /remove <mint>" },
-  { command: "clear", description: "Stop tracking everything" },
-  { command: "reload", description: "Reload watchlist.json from disk" },
+  { command: "lp", description: "LP positions (#1, #2 …) + TP/SL: /lp [list|status|set|unset|reload]" },
+  { command: "status", description: "Detailed LP status: /status [number] (omit number for all)" },
+  { command: "set", description: "Set LP TP/SL by number: /set sl 1 20% or /set 1 tp 20 sl 10" },
+  { command: "close", description: "Auto-close on TP/SL: /close <#> [tp <pct>] [sl <pct>] · /close list · /close off <#>" },
   { command: "help", description: "Show all commands" },
   { command: "start", description: "Show all commands" },
 ];
 
 const HELP = [
   "tokenWatcher commands:",
-  "/pos <position|pool> [wallet|pool]  — analyse your LP + scan the pool's top wallets",
-  "     e.g. /pos <positionAddress> <poolAddress>",
-  "     e.g. /pos <poolAddress> <walletAddress>",
-  "     e.g. /pos https://app.meteora.ag/dlmm/<pool>",
-  "/add <mint> <target> [above|below]  — track a mint (default: above)",
-  "/list  — tracked mints with live price + status",
-  "/remove <mint>  — stop tracking a mint",
-  "/clear  — stop tracking everything",
-  "/reload  — reload config/watchlist.json from disk",
+  "/lp  — list auto-detected LP positions with numbers (#1, #2 …)",
+  "/status [number]  — detailed LP status (all positions if number omitted)",
+  "/lp set <#|position> [tp <pct>] [sl <pct>]  — e.g. /lp set 1 tp 20 sl 10",
+  "/set <tp|sl> <#|position> <pct>  — e.g. /set sl 1 20%",
+  "/lp unset <#|position>  — remove an override",
+  "/lp reload  — reload wallets + overrides from disk",
+  "/close <#> [tp <pct>] [sl <pct>]  — arm auto-close, e.g. /close 1 tp 10 sl 20",
+  "/close list  — show armed auto-close orders",
+  "/close off <#>  — disarm an auto-close order",
   "/help  — this message",
 ].join("\n");
 
-function parseDirection(raw: string | undefined): Direction | null {
-  if (!raw) return "above";
-  const value = raw.toLowerCase();
-  if (value === "above" || value === "over" || value === ">") return "above";
-  if (value === "below" || value === "under" || value === "<") return "below";
-  return null;
+function parsePercent(raw: string | undefined): number | null {
+  if (raw === undefined) return null;
+  const value = Number(raw.replace(/%$/, ""));
+  return Number.isFinite(value) && value >= 0 ? value : null;
 }
 
-function forgetFiredStates(state: FiredState, address: string): number {
-  let removed = 0;
-  for (const key of Object.keys(state)) {
-    if (key.startsWith(`${address}:`)) {
-      delete state[key];
-      removed += 1;
-    }
+function isPositionRef(token: string): boolean {
+  return /^#?\d+$/.test(token) || isBase58(token);
+}
+
+function parseLpSetArgs(
+  args: string[],
+  options: { requireTarget?: boolean } = {},
+): { ref: string; target: LpTarget } | { error: string } {
+  const requireTarget = options.requireTarget !== false;
+  const clean = args.filter((token) => token && token !== "%").map((token) => token.trim());
+  if (clean.length === 0) {
+    return {
+      error:
+        "Usage: /lp set <#|position> [tp <pct>] [sl <pct>]\n" +
+        "Examples: /lp set 1 tp 20 sl 10 · /lp set sl 1 20%",
+    };
   }
-  return removed;
+
+  const first = clean[0];
+  const key = first.toLowerCase();
+  let ref: string;
+  let rest: string[];
+
+  if (isPositionRef(first)) {
+    ref = first;
+    rest = clean.slice(1);
+  } else if ((key === "tp" || key === "sl") && clean.length >= 3 && isPositionRef(clean[1])) {
+    ref = clean[1];
+    rest = [first, clean[2], ...clean.slice(3)];
+  } else {
+    return {
+      error:
+        "Could not find a position number or address.\n" +
+        "Usage: /lp set <#|position> [tp <pct>] [sl <pct>]",
+    };
+  }
+
+  const target: LpTarget = {};
+  for (let i = 0; i < rest.length; i += 2) {
+    const field = rest[i]?.toLowerCase();
+    const raw = rest[i + 1];
+    if (field !== "tp" && field !== "sl") {
+      return { error: `Unknown field "${rest[i]}". Use tp <pct> and/or sl <pct>.` };
+    }
+    const value = parsePercent(raw);
+    if (value === null) {
+      return { error: `Invalid ${field} value "${raw ?? ""}".` };
+    }
+    if (field === "tp") target.tpPct = value;
+    else target.slPct = value;
+  }
+
+  if (requireTarget && target.tpPct === undefined && target.slPct === undefined) {
+    return {
+      error: "Nothing to set. Usage: /lp set <#|position> [tp <pct>] [sl <pct>]",
+    };
+  }
+
+  return { ref, target };
+}
+
+function resolveLpPosition(ref: string, tracker: LpTrackerHandle): string | { error: string } {
+  const cleaned = ref.replace(/^#/, "");
+  if (/^\d+$/.test(cleaned)) {
+    const number = Number(cleaned);
+    const row = tracker.snapshot().find((entry) => entry.number === number);
+    if (!row) {
+      return { error: `No position #${number}. Send /lp to see current numbers.` };
+    }
+    return row.position;
+  }
+  if (isBase58(ref)) return ref;
+  return { error: `"${ref}" is not a position number or address.` };
+}
+
+function refLabel(ref: string, position: string): string {
+  return /^#?\d+$/.test(ref) ? `#${ref.replace(/^#/, "")}` : position;
+}
+
+function resolveCloseRef(
+  ref: string,
+  tracker: LpTrackerHandle,
+  executor: CloseExecutorHandle,
+): string | { error: string } {
+  const resolved = resolveLpPosition(ref, tracker);
+  if (typeof resolved === "string") return resolved;
+
+  const cleaned = ref.replace(/^#/, "");
+  if (/^\d+$/.test(cleaned)) {
+    const number = Number(cleaned);
+    const order = executor.list().find((entry) => entry.number === number);
+    if (order) return order.position;
+  }
+  return resolved;
+}
+
+async function applyLpSet(
+  args: string[],
+  tracker: LpTrackerHandle,
+  reply: (text: string) => Promise<void>,
+): Promise<void> {
+  const parsed = parseLpSetArgs(args);
+  if ("error" in parsed) {
+    await reply(parsed.error);
+    return;
+  }
+
+  const resolved = resolveLpPosition(parsed.ref, tracker);
+  if (typeof resolved !== "string") {
+    await reply(resolved.error);
+    return;
+  }
+
+  tracker.setTarget(resolved, parsed.target);
+  const label = refLabel(parsed.ref, resolved);
+  const lines = [`✅ Override saved for ${label}`];
+  lines.push(
+    `${parsed.target.tpPct !== undefined ? `TP +${parsed.target.tpPct}%` : "TP unchanged"} · ` +
+      `${parsed.target.slPct !== undefined ? `SL -${parsed.target.slPct}%` : "SL unchanged"}`,
+  );
+  await reply(lines.join("\n"));
+}
+
+async function applyLpStatus(
+  args: string[],
+  tracker: LpTrackerHandle,
+  reply: (text: string) => Promise<void>,
+  replyLong: (text: string) => Promise<void>,
+): Promise<void> {
+  const rows = tracker.snapshot();
+  if (rows.length === 0) {
+    await reply("No open LP positions detected yet. The tracker polls the Meteora API automatically.");
+    return;
+  }
+
+  const ref = args[0];
+  if (ref) {
+    const resolved = resolveLpPosition(ref, tracker);
+    if (typeof resolved !== "string") {
+      await reply(resolved.error);
+      return;
+    }
+    const row = rows.find((entry) => entry.position === resolved);
+    if (!row) {
+      await reply(`Position ${refLabel(ref, resolved)} is tracked but not in the latest snapshot. Send /lp.`);
+      return;
+    }
+    await replyLong(formatPositionStatus(row));
+    return;
+  }
+
+  const ordered = [...rows].sort((a, b) => a.number - b.number);
+  const text = ordered.map(formatPositionStatus).join("\n\n──────────\n\n");
+  await replyLong(text);
 }
 
 export async function handleCommand(text: string, ctx: CommandContext): Promise<void> {
-  const { config, store, state, saveState, reply, replyLong } = ctx;
+  const { reply, replyLong } = ctx;
   const trimmed = (text ?? "").trim();
   if (!trimmed.startsWith("/")) return;
 
@@ -78,146 +214,254 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
       await reply(HELP);
       return;
 
-    case "/pos": {
-      const input = args.join(" ").trim();
-      if (!input) {
+    case "/lp": {
+      const tracker = ctx.lp;
+      if (!tracker) {
         await reply(
-          "Usage: /pos <position|pool> [wallet|pool]\n" +
-            "Examples:\n" +
-            "  /pos <positionAddress> <poolAddress>\n" +
-            "  /pos <poolAddress> <walletAddress>\n" +
-            "  /pos https://app.meteora.ag/dlmm/<pool>",
+          "LP tracker is not running.\n" +
+            "Add wallets to config/lp-wallets.json, keep lp.enabled=true in config/app.json, then restart.",
         );
         return;
       }
-      await reply("🔎 Analysing position + scanning pool wallets… (this can take ~20-40s)");
-      try {
-        const sections = await analyzePositionInput(input, {
-          rpcUrl: config.solanaRpcUrl,
-          topWallets: config.posTopWallets,
+
+      const sub = (args[0] ?? "list").toLowerCase();
+
+      if (sub === "list") {
+        const rows = tracker.snapshot();
+        if (rows.length === 0) {
+          await reply("No open LP positions detected yet. The tracker polls the Meteora API automatically.");
+          return;
+        }
+        const lines = rows.map((row) => {
+          const status =
+            row.isOutOfRange === null ? "—" : row.isOutOfRange ? "OUT of range" : "IN range";
+          const pnl =
+            row.pnlPct === null
+              ? "n/a"
+              : `${row.pnlPct >= 0 ? "+" : ""}${row.pnlPct.toFixed(2)}%`;
+          return (
+            `#${row.number} · ${row.poolName} · ${row.walletLabel}\n` +
+            `  PnL ${pnl} · Bal ${formatUsd(row.balances)} · ${status}\n` +
+            `  TP +${row.tpPct}% / SL -${row.slPct}%`
+          );
         });
-        await replyLong(sections.join("\n\n"));
-      } catch (err) {
-        await reply(`Position analysis failed: ${(err as Error).message}`);
+        await reply(`LP positions (${rows.length}):\n\n${lines.join("\n\n")}`);
+        return;
       }
+
+      if (sub === "status") {
+        await applyLpStatus(args.slice(1), tracker, reply, replyLong);
+        return;
+      }
+
+      if (sub === "reload") {
+        tracker.reload();
+        await reply("🔄 LP tracker reloaded wallets + overrides from disk.");
+        return;
+      }
+
+      if (sub === "set") {
+        await applyLpSet(args.slice(1), tracker, reply);
+        return;
+      }
+
+      if (sub === "unset" || sub === "clear") {
+        const ref = args[1];
+        if (!ref) {
+          await reply("Usage: /lp unset <#|position>");
+          return;
+        }
+        const resolved = resolveLpPosition(ref, tracker);
+        if (typeof resolved !== "string") {
+          await reply(resolved.error);
+          return;
+        }
+        const removed = tracker.clearTarget(resolved);
+        const label = refLabel(ref, resolved);
+        await reply(
+          removed
+            ? `🗑️ Override removed for ${label}. Wallet/default thresholds apply.`
+            : `No override stored for ${label}.`,
+        );
+        return;
+      }
+
+      await reply(
+        "LP tracker commands:\n" +
+          "/lp  — list detected positions with numbers (#1, #2 …)\n" +
+          "/status [number]  — detailed status\n" +
+          "/lp set <#|position> [tp <pct>] [sl <pct>]\n" +
+          "/set <tp|sl> <#|position> <pct>\n" +
+          "/lp unset <#|position>\n" +
+          "/lp reload",
+      );
       return;
     }
 
-    case "/add": {
-      if (args.length < 2) {
-        await reply("Usage: /add <mint> <target> [above|below]\nExample: /add 7ga6rtE... 2.75 above");
+    case "/status": {
+      const tracker = ctx.lp;
+      if (!tracker) {
+        await reply(
+          "LP tracker is not running.\n" +
+            "Add wallets to config/lp-wallets.json, keep lp.enabled=true in config/app.json, then restart.",
+        );
         return;
       }
-      const [mint, targetRaw, directionRaw] = args;
-      const target = Number(targetRaw);
-      if (!Number.isFinite(target) || target <= 0) {
-        await reply(`Invalid target price "${targetRaw}".`);
+      await applyLpStatus(args, tracker, reply, replyLong);
+      return;
+    }
+
+    case "/set": {
+      const tracker = ctx.lp;
+      if (!tracker) {
+        await reply(
+          "LP tracker is not running.\n" +
+            "Add wallets to config/lp-wallets.json, keep lp.enabled=true in config/app.json, then restart.",
+        );
         return;
       }
-      const direction = parseDirection(directionRaw);
-      if (!direction) {
-        await reply(`Invalid direction "${directionRaw}". Use above or below.`);
+      await applyLpSet(args, tracker, reply);
+      return;
+    }
+
+    case "/close": {
+      const executor = ctx.close;
+      if (!executor) {
+        await reply(
+          "Auto-close executor is not running.\n" +
+            "Set LP_EXECUTOR_PRIVATE_KEY in .env, keep executor.enabled=true in config/app.json, then restart.",
+        );
         return;
       }
 
-      let info;
+      const tracker = ctx.lp;
+      const sub = (args[0] ?? "list").toLowerCase();
+
+      if (sub === "list" || sub === "status") {
+        const all = executor.list();
+        const active = all.filter((order) => order.status !== "done");
+        const doneCount = all.length - active.length;
+        if (active.length === 0) {
+          await reply(
+            doneCount > 0
+              ? `No active auto-close orders (${doneCount} completed).`
+              : "No auto-close orders armed. Use /close <#> [tp <pct>] [sl <pct>].",
+          );
+          return;
+        }
+        const lines = active.map((order) => {
+          const ref = order.number ? `#${order.number}` : "order";
+          const tp = order.tpPct !== undefined ? `+${order.tpPct}%` : "—";
+          const sl = order.slPct !== undefined ? `-${order.slPct}%` : "—";
+          const retry =
+            order.nextAttemptAt && order.status === "armed"
+              ? `\n  next retry: ${order.nextAttemptAt}`
+              : "";
+          const error = order.lastError ? `\n  last error: ${order.lastError}` : "";
+          return (
+            `${ref} · ${order.status.toUpperCase()}\n` +
+            `  TP ${tp} / SL ${sl} · attempts ${order.attempts}${retry}${error}`
+          );
+        });
+        const suffix = doneCount > 0 ? `\n\nCompleted: ${doneCount}` : "";
+        await reply(`Auto-close orders (${active.length} active):\n\n${lines.join("\n\n")}${suffix}`);
+        return;
+      }
+
+      if (sub === "off" || sub === "cancel" || sub === "remove") {
+        const ref = args[1];
+        if (!ref) {
+          await reply("Usage: /close off <#|position>");
+          return;
+        }
+        if (!tracker) {
+          await reply("LP tracker is not running; cannot resolve position numbers.");
+          return;
+        }
+        const resolved = resolveCloseRef(ref, tracker, executor);
+        if (typeof resolved !== "string") {
+          await reply(resolved.error);
+          return;
+        }
+        const removed = executor.disarm(resolved);
+        await reply(
+          removed
+            ? `🗑️ Auto-close disarmed for ${refLabel(ref, resolved)}.`
+            : `No auto-close order removed for ${refLabel(ref, resolved)} (not armed or currently executing).`,
+        );
+        return;
+      }
+
+      if (!tracker) {
+        await reply("LP tracker is not running; cannot resolve position numbers.");
+        return;
+      }
+
+      const parsed = parseLpSetArgs(args, { requireTarget: false });
+      if ("error" in parsed) {
+        await reply(
+          "Usage: /close <#|position> [tp <pct>] [sl <pct>]\n" +
+            "Examples: /close 1 tp 10 sl 20 · /close 2 · /close list · /close off 1",
+        );
+        return;
+      }
+
+      const resolved = resolveLpPosition(parsed.ref, tracker);
+      if (typeof resolved !== "string") {
+        await reply(resolved.error);
+        return;
+      }
+
+      const row = tracker.snapshot().find((entry) => entry.position === resolved);
+      if (!row) {
+        await reply(
+          `Position ${refLabel(parsed.ref, resolved)} is not in the latest snapshot. Send /lp and retry.`,
+        );
+        return;
+      }
+
+      if (row.wallet !== executor.owner) {
+        await reply(
+          `Cannot auto-close ${refLabel(parsed.ref, resolved)}: the executor key does not own this position's wallet.`,
+        );
+        return;
+      }
+
+      const tpPct = parsed.target.tpPct ?? row.tpPct;
+      const slPct = parsed.target.slPct ?? row.slPct;
+      if (tpPct <= 0 && slPct <= 0) {
+        await reply("Both TP and SL are disabled; nothing would trigger the close.");
+        return;
+      }
+
       try {
-        info = await getTokenInfo(config.gmgnApiKey, CHAIN, mint);
+        executor.arm({
+          position: row.position,
+          pool: row.pool,
+          wallet: row.wallet,
+          number: row.number,
+          tpPct: parsed.target.tpPct,
+          slPct: parsed.target.slPct,
+        });
       } catch (err) {
-        await reply(`Could not fetch mint ${mint}: ${(err as Error).message}`);
+        await reply(`Could not arm auto-close: ${(err as Error).message}`);
         return;
       }
 
-      const item: WatchItem = {
-        address: info.address,
-        symbol: info.symbol,
-        target: { price: target, direction },
-        pings: config.pingCount,
-      };
-
-      const previouslyFired = forgetFiredStates(state, info.address);
-      if (previouslyFired > 0) saveState(state);
-      store.add(item);
-
-      const hitNow = isHit(info.price, item);
       await reply(
         [
-          `✅ Now tracking ${info.symbol}`,
-          `${info.address}`,
-          `Target: ${direction} $${formatPrice(target)}`,
-          `Current: $${formatPrice(info.price)}`,
-          hitNow ? "⚠️ Target already met — will fire 5 pings on next check." : "",
-          `${store.count()} mint(s) tracked together.`,
+          `✅ Auto-close armed for ${refLabel(parsed.ref, resolved)}`,
+          `${row.poolName} · ${row.walletLabel}`,
+          `Trigger: TP +${tpPct}% / SL -${slPct}%`,
+          "On trigger: remove 100% liquidity, claim fees/rewards, swap all to SOL.",
+          row.pnlPct !== null &&
+          ((tpPct > 0 && row.pnlPct >= tpPct) || (slPct > 0 && row.pnlPct <= -slPct))
+            ? `⚠️ Current PnL ${row.pnlPct.toFixed(2)}% already breaches this trigger — closing on the next tick.`
+            : "",
         ]
           .filter(Boolean)
           .join("\n"),
       );
-      return;
-    }
-
-    case "/list": {
-      const items = store.list();
-      if (items.length === 0) {
-        await reply("No mints tracked yet. Use /add <mint> <target> [above|below].");
-        return;
-      }
-      const lines = await Promise.all(
-        items.map(async (item) => {
-          const label = item.symbol ?? item.address;
-          try {
-            const info = await getTokenInfo(config.gmgnApiKey, CHAIN, item.address);
-            const hit = isHit(info.price, item);
-            return (
-              `• ${info.symbol || label}\n` +
-              `  ${item.address}\n` +
-              `  now $${formatPrice(info.price)} → ${item.target.direction} $${formatPrice(item.target.price)} ` +
-              `${hit ? "✅ HIT" : "⏳ waiting"}`
-            );
-          } catch (err) {
-            return (
-              `• ${label}\n  ${item.address}\n` +
-              `  target ${item.target.direction} $${formatPrice(item.target.price)}\n` +
-              `  ⚠️ price error: ${(err as Error).message}`
-            );
-          }
-        }),
-      );
-      await reply(`Tracking ${items.length} mint(s):\n\n${lines.join("\n\n")}`);
-      return;
-    }
-
-    case "/remove": {
-      const mint = args[0];
-      if (!mint) {
-        await reply("Usage: /remove <mint>");
-        return;
-      }
-      const removed = store.remove(mint);
-      const cleared = forgetFiredStates(state, mint);
-      if (cleared > 0) saveState(state);
-      await reply(
-        removed
-          ? `🗑️ Removed ${mint}.\n${store.count()} mint(s) tracked.`
-          : `Not tracking ${mint}.`,
-      );
-      return;
-    }
-
-    case "/clear": {
-      const removed = store.clear();
-      for (const key of Object.keys(state)) delete state[key];
-      saveState(state);
-      await reply(`🗑️ Removed all ${removed} mint(s).`);
-      return;
-    }
-
-    case "/reload": {
-      try {
-        store.reload();
-        await reply(`🔄 Reloaded from disk. ${store.count()} mint(s) tracked.`);
-      } catch (err) {
-        await reply(`Reload failed: ${(err as Error).message}`);
-      }
       return;
     }
 

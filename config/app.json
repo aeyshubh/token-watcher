@@ -1,0 +1,25 @@
+{
+  "telegramChatId": "867827791",
+  "solanaRpcUrl": "https://api.mainnet-beta.solana.com",
+  "lp": {
+    "enabled": true,
+    "intervalMs": 15000,
+    "maxRps": 20,
+    "defaultTpPct": 20,
+    "defaultSlPct": 10,
+    "alertCooldownMs": 900000,
+    "oorCooldownMs": 3600000,
+    "minPositionUsd": 1,
+    "nearRangeWidthPct": 10
+  },
+  "executor": {
+    "enabled": true,
+    "rpcUrl": "",
+    "slippageBps": 300,
+    "priorityFeeCapLamports": 5000000,
+    "retryBaseMs": 5000,
+    "retryMaxMs": 300000,
+    "maxAttempts": 0,
+    "computeUnitLimit": 1400000
+  }
+}

@@ -57,11 +57,13 @@ export async function sendMessage(
   botToken: string,
   chatId: string,
   text: string,
+  parseMode?: "HTML" | "MarkdownV2",
 ): Promise<void> {
   await call(botToken, "sendMessage", {
     chat_id: chatId,
     text,
     disable_web_page_preview: true,
+    ...(parseMode ? { parse_mode: parseMode } : {}),
   });
 }
 

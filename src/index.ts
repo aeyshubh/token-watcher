@@ -1,14 +1,9 @@
-import { loadConfig } from "./config";
-import { getTokenInfo } from "./gmgn";
 import { sendMessage, sendLongMessage, getUpdates, setMyCommands } from "./telegram";
-import { loadState, saveState } from "./state";
-import { formatAlert, formatPrice, isHit, targetKey } from "./alerts";
-import { WatchStore } from "./store";
 import { handleCommand, BOT_COMMANDS } from "./commands";
-import { loadScoutConfig, startScout, type ScoutHandle } from "./scout";
-import type { AppConfig, FiredState } from "./types";
-
-const CHAIN = "sol";
+import { loadLpConfig, startLpTracker, type LpTrackerHandle } from "./lp";
+import { loadCloseConfig } from "./close-config";
+import { startCloseExecutor, type CloseExecutorHandle } from "./executor";
+import { loadSettings, requireTelegramChatId } from "./settings";
 
 function log(message: string): void {
   console.log(`[${new Date().toISOString()}] ${message}`);
@@ -18,65 +13,17 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function priceTick(
-  config: AppConfig,
-  store: WatchStore,
-  state: FiredState,
-): Promise<void> {
-  for (const item of store.list()) {
-    const label = item.symbol ?? item.address;
-    const key = targetKey(item);
-
-    let info;
-    try {
-      info = await getTokenInfo(config.gmgnApiKey, CHAIN, item.address);
-    } catch (err) {
-      log(`fetch failed for ${label}: ${(err as Error).message}`);
-      continue;
-    }
-
-    const price = info.price;
-    const hit = isHit(price, item);
-    const alreadyFired = Boolean(state[key]);
-
-    log(
-      `${info.symbol || label} $${formatPrice(price)} vs ${item.target.direction} ` +
-        `$${formatPrice(item.target.price)} -> ${hit ? "HIT" : "wait"}` +
-        `${alreadyFired ? " (already fired)" : ""}`,
-    );
-
-    if (alreadyFired || !hit) continue;
-
-    const pings = item.pings || config.pingCount;
-    for (let i = 1; i <= pings; i += 1) {
-      const text = formatAlert({
-        symbol: info.symbol || label,
-        price,
-        target: item.target.price,
-        direction: item.target.direction,
-        address: item.address,
-        index: i,
-        total: pings,
-        when: new Date(),
-      });
-      try {
-        await sendMessage(config.telegramBotToken, config.telegramChatId, text);
-        log(`sent ping ${i}/${pings} for ${label}`);
-      } catch (err) {
-        log(`telegram send failed (${i}/${pings}) for ${label}: ${(err as Error).message}`);
-      }
-      if (i < pings) await sleep(config.pingDelayMs);
-    }
-
-    state[key] = { firedAt: new Date().toISOString(), price };
-    saveState(state);
-    log(`target fired for ${label}; persisted to state.json`);
+function required(name: string): string {
+  const value = process.env[name];
+  if (!value || !value.trim()) {
+    throw new Error(`Missing required environment variable: ${name}`);
   }
+  return value.trim();
 }
 
-async function drainUpdates(config: AppConfig): Promise<number> {
+async function drainUpdates(botToken: string): Promise<number> {
   try {
-    const updates = await getUpdates(config.telegramBotToken, 0, 0);
+    const updates = await getUpdates(botToken, 0, 0);
     const maxId = updates.reduce((max, update) => Math.max(max, update.updateId), 0);
     return maxId + 1;
   } catch (err) {
@@ -86,79 +33,88 @@ async function drainUpdates(config: AppConfig): Promise<number> {
 }
 
 async function main(): Promise<void> {
-  const config = loadConfig();
-  const store = new WatchStore();
-  const state = loadState();
+  const settings = loadSettings();
+  const botToken = required("TELEGRAM_BOT_TOKEN");
+  const chatId = requireTelegramChatId();
 
-  const scoutEnabled = (process.env.SCOUT_ENABLED ?? "true").toLowerCase() !== "false";
+  const lpEnabled = settings.lp.enabled;
+  const executorEnabled = settings.executor.enabled;
 
   log(
-    `tokenWatcher started · poll=${config.pollIntervalMs}ms · ` +
-      `tokens=${store.count()} · chat=${config.telegramChatId} · ` +
-      `scout=${scoutEnabled ? "on" : "off"}`,
+    `tokenWatcher started · chat=${chatId} · ` +
+      `lp=${lpEnabled ? "on" : "off"} · executor=${executorEnabled ? "on" : "off"}`,
   );
 
+  const reply = (text: string): Promise<void> => sendMessage(botToken, chatId, text);
+  const replyLong = (text: string): Promise<void> => sendLongMessage(botToken, chatId, text);
+
   try {
-    await setMyCommands(config.telegramBotToken, BOT_COMMANDS);
+    await setMyCommands(botToken, BOT_COMMANDS);
     log("registered bot command menu");
   } catch (err) {
     log(`could not register command menu: ${(err as Error).message}`);
   }
 
-  let scout: ScoutHandle | undefined;
-  if (scoutEnabled) {
+  let close: CloseExecutorHandle | undefined;
+  if (executorEnabled) {
     try {
-      scout = startScout(
-        loadScoutConfig({
-          botToken: config.telegramBotToken,
-          chatId: config.telegramChatId,
-          gmgnApiKey: config.gmgnApiKey,
-        }),
-      );
+      const closeConfig = loadCloseConfig({ botToken, chatId });
+      if (!closeConfig) {
+        log("auto-close executor disabled: set LP_EXECUTOR_PRIVATE_KEY in .env to enable it");
+      } else {
+        close = startCloseExecutor(closeConfig, { send: reply, log });
+      }
     } catch (err) {
-      log(`could not start scout: ${(err as Error).message}`);
+      log(`could not start auto-close executor: ${(err as Error).message}`);
     }
   }
 
+  let lp: LpTrackerHandle | undefined;
+  if (lpEnabled) {
+    try {
+      const lpConfig = loadLpConfig({ botToken, chatId });
+      if (lpConfig.wallets.length === 0) {
+        log("LP tracker disabled: config/lp-wallets.json has no wallets");
+      } else {
+        lp = startLpTracker(lpConfig, { onTick: close?.onTick });
+      }
+    } catch (err) {
+      log(`could not start LP tracker: ${(err as Error).message}`);
+    }
+  }
+
+  if (close && !lp) {
+    log("auto-close executor will not run: LP tracker is disabled or has no wallets");
+  }
+
   let running = true;
-  const timers: NodeJS.Timeout[] = [];
 
   const shutdown = (signal: string): void => {
     if (!running) return;
     running = false;
     log(`received ${signal}, shutting down`);
-    scout?.stop();
-    for (const timer of timers) clearTimeout(timer);
+    lp?.stop();
+    close?.stop();
     setTimeout(() => process.exit(0), 50);
   };
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
 
-  const reply = (text: string): Promise<void> =>
-    sendMessage(config.telegramBotToken, config.telegramChatId, text);
-
-  const replyLong = (text: string): Promise<void> =>
-    sendLongMessage(config.telegramBotToken, config.telegramChatId, text);
-
-  const runPriceLoop = async (): Promise<void> => {
-    try {
-      await priceTick(config, store, state);
-    } catch (err) {
-      log(`tick error: ${(err as Error).message}`);
-    }
-    if (running) timers.push(setTimeout(runPriceLoop, config.pollIntervalMs));
-  };
-
   const runCommandLoop = async (): Promise<void> => {
-    let offset = await drainUpdates(config);
+    let offset = await drainUpdates(botToken);
     while (running) {
       try {
-        const updates = await getUpdates(config.telegramBotToken, offset, 30);
+        const updates = await getUpdates(botToken, offset, 30);
         for (const update of updates) {
           offset = update.updateId + 1;
-          if (String(update.chatId) !== config.telegramChatId) continue;
+          if (String(update.chatId) !== chatId) continue;
           try {
-            await handleCommand(update.text, { config, store, state, saveState, reply, replyLong });
+            await handleCommand(update.text, {
+              reply,
+              replyLong,
+              lp,
+              close,
+            });
           } catch (err) {
             log(`command error: ${(err as Error).message}`);
           }
@@ -170,7 +126,6 @@ async function main(): Promise<void> {
     }
   };
 
-  void runPriceLoop();
   void runCommandLoop();
 }
 

@@ -1,6 +1,14 @@
+import {
+  acquireMeteoraSlot,
+  markMeteoraRateLimited,
+  MeteoraRateLimitError,
+} from "./meteora-rate";
+
 const HOST = "https://dlmm.datapi.meteora.ag";
 const MAX_ATTEMPTS = 4;
 const REQUEST_TIMEOUT_MS = 20000;
+const PORTFOLIO_PAGE_SIZE = 50;
+const PORTFOLIO_MAX_PAGES = 20;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -11,12 +19,16 @@ async function getJson<T>(path: string): Promise<T | null> {
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
     try {
+      await acquireMeteoraSlot();
       const res = await fetch(`${HOST}${path}`, {
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
 
       if (res.status === 404 || res.status === 400) return null;
-      if (res.status === 429 || res.status >= 500) {
+      if (res.status === 429) {
+        throw new MeteoraRateLimitError(await markMeteoraRateLimited(res));
+      }
+      if (res.status >= 500) {
         const retryAfter = Number(res.headers.get("retry-after"));
         const waitMs = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : attempt * 1500;
         throw new Error(`Meteora HTTP ${res.status} (retry in ${waitMs}ms)`);
@@ -25,48 +37,13 @@ async function getJson<T>(path: string): Promise<T | null> {
 
       return (await res.json()) as T;
     } catch (err) {
+      if (err instanceof MeteoraRateLimitError) throw err;
       lastError = err instanceof Error ? err : new Error(String(err));
       if (attempt < MAX_ATTEMPTS) await sleep(attempt * 1200);
     }
   }
 
   throw lastError;
-}
-
-export interface MeteoraTokenDetail {
-  address: string;
-  symbol: string;
-  name: string;
-  decimals: number;
-  price: number;
-  market_cap: number | null;
-  holders?: number;
-  freeze_authority_disabled?: boolean;
-}
-
-export interface TimeWindowMetrics {
-  "30m": number;
-  "1h": number;
-  "2h": number;
-  "4h": number;
-  "12h": number;
-  "24h": number;
-}
-
-export interface MeteoraPoolDetail {
-  address: string;
-  name: string;
-  token_x: MeteoraTokenDetail;
-  token_y: MeteoraTokenDetail;
-  tvl: number;
-  current_price: number;
-  volume: TimeWindowMetrics;
-  fees: TimeWindowMetrics;
-  fee_tvl_ratio: TimeWindowMetrics;
-  dynamic_fee_pct: number;
-  pool_config: { bin_step: number; base_fee_pct: number; protocol_fee_pct: number; collect_fee_mode: number };
-  launchpad?: string | null;
-  is_blacklisted: boolean;
 }
 
 export interface TokenAmount {
@@ -125,10 +102,6 @@ interface PositionPnlResponse {
   solPrice?: string | null;
 }
 
-export async function fetchPool(address: string): Promise<MeteoraPoolDetail | null> {
-  return getJson<MeteoraPoolDetail>(`/pools/${address}`);
-}
-
 export async function fetchPositions(
   pool: string,
   user: string,
@@ -149,29 +122,75 @@ export async function fetchPositions(
   return out;
 }
 
-export interface WalletClaims {
-  totalClaimsUsd: number;
-  totalFeeUsd: number;
-  feeClaimCount: number;
-  lastFeeClaimTime?: string | null;
+export interface OpenPortfolioPool {
+  poolAddress: string;
+  binStep: number;
+  baseFee: number;
+  collectFeeMode: number;
+  tokenX: string;
+  tokenY: string;
+  tokenXMint: string;
+  tokenYMint: string;
+  tokenXIcon?: string;
+  tokenYIcon?: string;
+  rewardX?: string;
+  rewardY?: string;
+  balances: string;
+  balancesSol?: string | null;
+  unclaimedFees: string;
+  feePerTvl24h: string;
+  pnl: string;
+  pnlPctChange: string;
+  pnlSol?: string | null;
+  pnlSolPctChange?: string | null;
+  poolPrice?: number | null;
+  totalDeposit: string;
+  totalDepositSol?: string | null;
+  openPositionCount: number;
+  listPositions: string[];
+  positionsOutOfRange: string[];
+  outOfRange?: boolean | null;
 }
 
-export async function fetchTotalClaims(wallet: string, pool: string): Promise<WalletClaims | null> {
-  const res = await getJson<{
-    total_claims_usd?: string;
-    total_fee_x_usd?: string;
-    total_fee_y_usd?: string;
-    fee_claim_count?: number;
-    last_fee_claim_time?: string | null;
-  }>(`/wallets/${wallet}/pools/${pool}/total_claims`);
-  if (!res) return null;
-  const total = Number(res.total_claims_usd ?? 0);
-  const feeX = Number(res.total_fee_x_usd ?? 0);
-  const feeY = Number(res.total_fee_y_usd ?? 0);
-  return {
-    totalClaimsUsd: Number.isFinite(total) ? total : 0,
-    totalFeeUsd: (Number.isFinite(feeX) ? feeX : 0) + (Number.isFinite(feeY) ? feeY : 0),
-    feeClaimCount: res.fee_claim_count ?? 0,
-    lastFeeClaimTime: res.last_fee_claim_time ?? null,
-  };
+export interface OpenPortfolioResponse {
+  hasNext: boolean;
+  page: number;
+  pageSize: number;
+  pools: OpenPortfolioPool[];
+  solPrice?: string | null;
+  totalCount: number;
+  totalPositions: number;
 }
+
+const EMPTY_PORTFOLIO: OpenPortfolioResponse = {
+  hasNext: false,
+  page: 1,
+  pageSize: PORTFOLIO_PAGE_SIZE,
+  pools: [],
+  totalCount: 0,
+  totalPositions: 0,
+};
+
+/** All pools where a wallet has open DLMM positions (auto-detection entrypoint). */
+export async function fetchOpenPortfolio(
+  user: string,
+  maxPages: number = PORTFOLIO_MAX_PAGES,
+): Promise<OpenPortfolioResponse> {
+  const pools: OpenPortfolioPool[] = [];
+  let first: OpenPortfolioResponse | null = null;
+
+  for (let page = 1; page <= maxPages; page += 1) {
+    const res = await getJson<OpenPortfolioResponse>(
+      `/portfolio/open?user=${user}&page=${page}&page_size=${PORTFOLIO_PAGE_SIZE}`,
+    );
+    if (!res || !Array.isArray(res.pools)) break;
+    if (!first) first = res;
+    pools.push(...res.pools);
+    if (!res.hasNext) break;
+  }
+
+  const base = first ?? EMPTY_PORTFOLIO;
+  return { ...base, pools };
+}
+
+
