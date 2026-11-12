@@ -1,5 +1,11 @@
 import "dotenv/config";
-import { LP_WALLETS_PATH, loadLpConfig, trackOnce, type LpSnapshotEntry } from "../src/lp";
+import {
+  LP_WALLETS_PATH,
+  formatThresholdHit,
+  loadLpConfig,
+  trackOnce,
+  type LpSnapshotEntry,
+} from "../src/lp";
 import { loadLpState, saveLpState } from "../src/lp-state";
 
 function formatUsd(value: number | null): string {
@@ -16,13 +22,18 @@ function describe(row: LpSnapshotEntry): string {
     row.pnlPct === null ? "n/a" : `${row.pnlPct >= 0 ? "+" : ""}${row.pnlPct.toFixed(2)}%`;
   const status =
     row.isOutOfRange === null ? "—" : row.isOutOfRange ? "OUT of range" : "IN range";
-  return (
-    `#${row.number} · ${row.poolName} · ${row.walletLabel}\n` +
-    `  ${row.position}\n` +
+  const parts = [
+    `#${row.number} · ${row.poolName} · ${row.walletLabel}`,
+    `  ${row.position}`,
     `  PnL ${pnl} (${formatUsd(row.pnlUsd)}) · Bal ${formatUsd(row.balances)} · ` +
-    `deposit ${formatUsd(row.deposit)} · ${status}\n` +
-    `  TP +${row.tpPct}% / SL -${row.slPct}%`
-  );
+      `deposit ${formatUsd(row.deposit)} · ${status}`,
+    `  TP +${row.tpPct}% / SL -${row.slPct}%`,
+  ];
+  const tpHit = formatThresholdHit(row, "tp", row.tpPct);
+  if (tpHit) parts.push(`  ${tpHit}`);
+  const slHit = formatThresholdHit(row, "sl", row.slPct);
+  if (slHit) parts.push(`  ${slHit}`);
+  return parts.join("\n");
 }
 
 async function main(): Promise<void> {

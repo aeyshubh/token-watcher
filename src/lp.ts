@@ -54,6 +54,7 @@ export interface LpSnapshotEntry {
   pnlPct: number | null;
   pnlUsd: number | null;
   balances: number | null;
+  baseTokenUsd: number | null;
   deposit: number | null;
   fees: number | null;
   unclaimedFeesUsd: number | null;
@@ -444,6 +445,89 @@ function thresholdLabel(row: LpSnapshotEntry): string {
   return parts.join(" · ");
 }
 
+export type ThresholdKind = "tp" | "sl";
+
+export interface ThresholdPriceEstimate {
+  pnlPrice: number | null;
+  rawPrice: number | null;
+  breached: boolean;
+}
+
+function positiveOrNull(value: number | null): number | null {
+  return value !== null && Number.isFinite(value) && value > 0 ? value : null;
+}
+
+/**
+ * Estimate the pool price at which a TP/SL PnL threshold would trigger.
+ * `pnlPrice` is approximate (assumes local base-token sensitivity is constant);
+ * `rawPrice` is the simple price ±pct projection. Both are expectations, not guarantees.
+ */
+export function estimateThresholdPrice(
+  row: LpSnapshotEntry,
+  kind: ThresholdKind,
+  pct: number,
+): ThresholdPriceEstimate {
+  const pctValue = Number.isFinite(pct) && pct > 0 ? pct : 0;
+  const active = positiveOrNull(row.activePrice);
+  const deposit = positiveOrNull(row.deposit);
+  const baseTokenUsd = positiveOrNull(row.baseTokenUsd);
+
+  const rawCandidate =
+    active !== null && pctValue > 0
+      ? active * (1 + (kind === "tp" ? pctValue : -pctValue) / 100)
+      : null;
+  const rawPrice =
+    rawCandidate !== null && Number.isFinite(rawCandidate) && rawCandidate > 0
+      ? rawCandidate
+      : null;
+
+  const breached =
+    pctValue > 0 &&
+    row.pnlPct !== null &&
+    Number.isFinite(row.pnlPct) &&
+    (kind === "tp" ? row.pnlPct >= pctValue : row.pnlPct <= -pctValue);
+
+  let pnlPrice: number | null = null;
+  if (
+    active !== null &&
+    deposit !== null &&
+    baseTokenUsd !== null &&
+    pctValue > 0 &&
+    !breached &&
+    row.pnlPct !== null &&
+    Number.isFinite(row.pnlPct)
+  ) {
+    const targetPct = kind === "tp" ? pctValue : -pctValue;
+    const deltaUsd = ((targetPct - row.pnlPct) / 100) * deposit;
+    const candidate = active * (1 + deltaUsd / baseTokenUsd);
+    if (Number.isFinite(candidate) && candidate > 0) pnlPrice = candidate;
+  }
+
+  return { pnlPrice, rawPrice, breached };
+}
+
+export function formatThresholdHit(
+  row: LpSnapshotEntry,
+  kind: ThresholdKind,
+  pct: number,
+): string | null {
+  if (!(Number.isFinite(pct) && pct > 0)) return null;
+
+  const estimate = estimateThresholdPrice(row, kind, pct);
+  const label = kind === "tp" ? "TP hit (expected)" : "SL hit (expected)";
+  if (estimate.breached) return `${label}: breached now`;
+
+  const pnlPart =
+    estimate.pnlPrice !== null ? `≈${formatPrice(estimate.pnlPrice)} (PnL est)` : "n/a (PnL est)";
+  const sign = kind === "tp" ? "+" : "-";
+  const rawPart =
+    estimate.rawPrice !== null
+      ? `${formatPrice(estimate.rawPrice)} (price ${sign}${pct}%)`
+      : `n/a (price ${sign}${pct}%)`;
+
+  return `${label}: ${pnlPart} · ${rawPart}`;
+}
+
 export function formatPositionStatus(row: LpSnapshotEntry): string {
   const pnl = row.pnlPct === null ? "n/a" : formatPct(row.pnlPct);
   const pnlUsd = row.pnlUsd === null ? "n/a" : formatUsd(row.pnlUsd);
@@ -471,6 +555,10 @@ export function formatPositionStatus(row: LpSnapshotEntry): string {
 
   lines.push(`Age: ${age} · Fee/TVL 24h: ${feeTvl}`);
   lines.push(thresholdLabel(row));
+  const tpLine = formatThresholdHit(row, "tp", row.tpPct);
+  if (tpLine) lines.push(tpLine);
+  const slLine = formatThresholdHit(row, "sl", row.slPct);
+  if (slLine) lines.push(slLine);
   lines.push(`https://www.meteora.ag/dlmm/${row.pool}`);
   return lines.join("\n");
 }
@@ -587,6 +675,7 @@ export async function trackOnce(
         pnlPct: entry.lastPnlPct ?? null,
         pnlUsd: entry.lastPnlUsd ?? null,
         balances: entry.balances ?? null,
+        baseTokenUsd: null,
         deposit: entry.deposit ?? null,
         fees: null,
         unclaimedFeesUsd: null,
@@ -608,6 +697,7 @@ export async function trackOnce(
     const pnlPct = num(pnl.pnlPctChange);
     const pnlUsd = num(pnl.pnlUsd);
     const balances = num(pnl.unrealizedPnl?.balances);
+    const baseTokenUsd = numberOrNull(pnl.unrealizedPnl?.balanceTokenX.usd);
     const deposit = num(pnl.allTimeDeposits.total.usd);
     const fees = num(pnl.allTimeFees.total.usd);
     const unclaimedFeesUsd = pnl.unrealizedPnl
@@ -633,6 +723,7 @@ export async function trackOnce(
       pnlPct,
       pnlUsd,
       balances,
+      baseTokenUsd,
       deposit,
       fees,
       unclaimedFeesUsd,

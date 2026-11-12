@@ -1,6 +1,11 @@
 import { formatUsd } from "./format";
 import { isBase58 } from "./solana";
-import { formatPositionStatus, type LpTarget, type LpTrackerHandle } from "./lp";
+import {
+  formatPositionStatus,
+  formatThresholdHit,
+  type LpTarget,
+  type LpTrackerHandle,
+} from "./lp";
 import type { CloseExecutorHandle } from "./executor";
 
 export interface CommandContext {
@@ -157,6 +162,7 @@ async function applyLpSet(
     return;
   }
 
+  const row = tracker.snapshot().find((entry) => entry.position === resolved);
   tracker.setTarget(resolved, parsed.target);
   const label = refLabel(parsed.ref, resolved);
   const lines = [`✅ Override saved for ${label}`];
@@ -164,6 +170,18 @@ async function applyLpSet(
     `${parsed.target.tpPct !== undefined ? `TP +${parsed.target.tpPct}%` : "TP unchanged"} · ` +
       `${parsed.target.slPct !== undefined ? `SL -${parsed.target.slPct}%` : "SL unchanged"}`,
   );
+
+  if (!row) {
+    lines.push("Hit prices: n/a (position not in latest snapshot)");
+  } else {
+    const tpPct = parsed.target.tpPct ?? row.tpPct;
+    const slPct = parsed.target.slPct ?? row.slPct;
+    const tpLine = formatThresholdHit(row, "tp", tpPct);
+    if (tpLine) lines.push(tpLine);
+    const slLine = formatThresholdHit(row, "sl", slPct);
+    if (slLine) lines.push(slLine);
+  }
+
   await reply(lines.join("\n"));
 }
 
@@ -239,13 +257,18 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
             row.pnlPct === null
               ? "n/a"
               : `${row.pnlPct >= 0 ? "+" : ""}${row.pnlPct.toFixed(2)}%`;
-          return (
-            `#${row.number} · ${row.poolName} · ${row.walletLabel}\n` +
-            `  PnL ${pnl} · Bal ${formatUsd(row.balances)} · ${status}\n` +
-            `  TP +${row.tpPct}% / SL -${row.slPct}%`
-          );
+          const parts = [
+            `#${row.number} · ${row.poolName} · ${row.walletLabel}`,
+            `  PnL ${pnl} · Bal ${formatUsd(row.balances)} · ${status}`,
+            `  TP +${row.tpPct}% / SL -${row.slPct}%`,
+          ];
+          const tpHit = formatThresholdHit(row, "tp", row.tpPct);
+          if (tpHit) parts.push(`  ${tpHit}`);
+          const slHit = formatThresholdHit(row, "sl", row.slPct);
+          if (slHit) parts.push(`  ${slHit}`);
+          return parts.join("\n");
         });
-        await reply(`LP positions (${rows.length}):\n\n${lines.join("\n\n")}`);
+        await replyLong(`LP positions (${rows.length}):\n\n${lines.join("\n\n")}`);
         return;
       }
 
