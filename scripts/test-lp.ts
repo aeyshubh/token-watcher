@@ -2,6 +2,7 @@ import "dotenv/config";
 import {
   LP_WALLETS_PATH,
   formatThresholdHit,
+  formatThresholdSummary,
   loadLpConfig,
   trackOnce,
   type LpSnapshotEntry,
@@ -27,11 +28,12 @@ function describe(row: LpSnapshotEntry): string {
     `  ${row.position}`,
     `  PnL ${pnl} (${formatUsd(row.pnlUsd)}) · Bal ${formatUsd(row.balances)} · ` +
       `deposit ${formatUsd(row.deposit)} · ${status}`,
-    `  TP +${row.tpPct}% / SL -${row.slPct}%`,
+    `  ${formatThresholdSummary("tp", row.tpPct, row.tpPrice)} / ` +
+      `${formatThresholdSummary("sl", row.slPct, row.slPrice)}`,
   ];
-  const tpHit = formatThresholdHit(row, "tp", row.tpPct);
+  const tpHit = formatThresholdHit(row, "tp", row.tpPct, row.tpPrice);
   if (tpHit) parts.push(`  ${tpHit}`);
-  const slHit = formatThresholdHit(row, "sl", row.slPct);
+  const slHit = formatThresholdHit(row, "sl", row.slPct, row.slPrice);
   if (slHit) parts.push(`  ${slHit}`);
   return parts.join("\n");
 }
@@ -49,10 +51,15 @@ async function main(): Promise<void> {
   console.log(
     `Wallets: ${config.wallets
       .map((wallet) => {
-        const thresholds =
-          wallet.tpPct !== undefined || wallet.slPct !== undefined
-            ? ` [TP ${wallet.tpPct ?? "—"}% / SL ${wallet.slPct ?? "—"}%]`
-            : "";
+        const hasThresholds =
+          wallet.tpPct !== undefined ||
+          wallet.slPct !== undefined ||
+          wallet.tpPrice !== undefined ||
+          wallet.slPrice !== undefined;
+        const thresholds = hasThresholds
+          ? ` [${formatThresholdSummary("tp", wallet.tpPct ?? 0, wallet.tpPrice ?? null)} / ` +
+            `${formatThresholdSummary("sl", wallet.slPct ?? 0, wallet.slPrice ?? null)}]`
+          : "";
         return `${wallet.label} (${wallet.address})${thresholds}`;
       })
       .join(", ")}`,

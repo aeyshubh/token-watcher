@@ -3,11 +3,29 @@ import { Connection } from "@solana/web3.js";
 import { loadCloseConfig } from "../src/close-config";
 import { loadCloseState, saveCloseState } from "../src/close-state";
 import { executeClose } from "../src/close";
-import { loadLpConfig, trackOnce } from "../src/lp";
+import {
+  formatThresholdSummary,
+  loadLpConfig,
+  thresholdBreached,
+  trackOnce,
+  type ResolvedThreshold,
+} from "../src/lp";
 
 function formatPct(value: number | null): string {
   if (value === null) return "n/a";
   return `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;
+}
+
+function resolveOrderThreshold(
+  orderPrice: number | undefined,
+  orderPct: number | undefined,
+  rowPrice: number | null,
+  rowPct: number,
+): ResolvedThreshold {
+  if (orderPrice !== undefined) return { pct: 0, price: orderPrice };
+  if (orderPct !== undefined) return { pct: orderPct, price: null };
+  if (rowPrice !== null) return { pct: 0, price: rowPrice };
+  return { pct: rowPct, price: null };
 }
 
 function rpcLabel(url: string): string {
@@ -69,15 +87,16 @@ async function main(): Promise<void> {
       continue;
     }
 
-    const tpPct = order.tpPct ?? row.tpPct;
-    const slPct = order.slPct ?? row.slPct;
+    const tp = resolveOrderThreshold(order.tpPrice, order.tpPct, row.tpPrice, row.tpPct);
+    const sl = resolveOrderThreshold(order.slPrice, order.slPct, row.slPrice, row.slPct);
     const pnl = row.pnlPct;
-    const tpHit = pnl !== null && tpPct > 0 && pnl >= tpPct;
-    const slHit = pnl !== null && slPct > 0 && pnl <= -slPct;
+    const tpHit = thresholdBreached("tp", tp.pct, tp.price, row);
+    const slHit = thresholdBreached("sl", sl.pct, sl.price, row);
 
     console.log(`  ${row.poolName} · PnL ${formatPct(pnl)}`);
     console.log(
-      `  trigger TP +${tpPct}% / SL -${slPct}% -> ` +
+      `  trigger ${formatThresholdSummary("tp", tp.pct, tp.price)} / ` +
+        `${formatThresholdSummary("sl", sl.pct, sl.price)} -> ` +
         (tpHit ? "TP HIT" : slHit ? "SL HIT" : "waiting"),
     );
 
@@ -106,8 +125,15 @@ async function main(): Promise<void> {
       saveCloseState(state);
 
       console.log(
-        `  done: ${res.signatures.length} tx(s), ${res.swaps.length} swap(s)\n`,
+        `  done: ${res.signatures.length} tx(s), ${res.swaps.length} swap(s), ${res.skipped.length} skipped\n`,
       );
+      if (res.skipped.length > 0) {
+        console.log(
+          `  skipped: ${res.skipped
+            .map((row) => `${row.mint.slice(0, 4)}…${row.mint.slice(-4)}=${row.amount} (${row.reason})`)
+            .join(", ")}\n`,
+        );
+      }
     } catch (err) {
       order.lastError = (err as Error).message;
       saveCloseState(state);

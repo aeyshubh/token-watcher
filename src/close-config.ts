@@ -14,6 +14,7 @@ export interface CloseConfig {
   retryMaxMs: number;
   maxAttempts: number;
   computeUnitLimit: number;
+  jupiterApiKey: string;
 }
 
 function required(name: string): string {
@@ -51,5 +52,6 @@ export function loadCloseConfig(
     retryMaxMs: settings.executor.retryMaxMs,
     maxAttempts: settings.executor.maxAttempts,
     computeUnitLimit: settings.executor.computeUnitLimit,
+    jupiterApiKey: required("JUPITER_API_KEY"),
   };
 }

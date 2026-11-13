@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 export interface LpAlertTimes {
@@ -6,6 +6,7 @@ export interface LpAlertTimes {
   sl?: string;
   oor?: string;
   near?: string;
+  half?: string;
 }
 
 export interface LpPositionState {
@@ -40,7 +41,15 @@ export function loadLpState(): LpState {
 }
 
 export function saveLpState(state: LpState): void {
-  writeFileSync(STATE_PATH, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  writeFileSync(STATE_PATH, `${JSON.stringify(state, null, 2)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  try {
+    chmodSync(STATE_PATH, 0o600);
+  } catch {
+    // Best effort; some filesystems do not support POSIX modes.
+  }
 }
 
 export function resetLpState(): void {

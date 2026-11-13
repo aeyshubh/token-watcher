@@ -30,8 +30,8 @@ Every `lp.intervalMs` (default 15s):
 1. `GET /portfolio/open?user=<wallet>` — auto-discovers every open DLMM position and its pool.
 2. `GET /positions/{pool}/pnl?user=<wallet>&status=open` — per-position PnL, range and fees.
 3. Evaluates:
-   - **Take profit**: `pnlPctChange >= tpPct`
-   - **Stop loss**: `pnlPctChange <= -slPct`
+   - **Take profit**: `pnlPctChange >= tpPct` (PnL mode) or `poolActivePrice >= tpPrice` (price mode)
+   - **Stop loss**: `pnlPctChange <= -slPct` or `poolActivePrice <= slPrice`
    - **Out of range**: position transitions from in-range to out-of-range
 4. Applies cooldowns, persists to `lp-state.json`, sends Telegram.
 5. Positions no longer returned by `/portfolio/open` are pruned automatically.
@@ -49,11 +49,12 @@ Dust positions below `lp.minPositionUsd` are tracked but never trigger alerts.
 ```json
 [
   { "address": "<walletAddress>", "label": "main", "tpPct": 10, "slPct": 10 },
+  { "address": "<walletAddress>", "label": "price-mode", "tpPrice": 0.0001917, "slPrice": 0.0001620 },
   { "address": "<walletAddress>", "label": "degen" }
 ]
 ```
 
-Plain address strings are also accepted. `tpPct` / `slPct` are optional wallet-level thresholds. Every configured wallet is scanned each tick.
+Plain address strings are also accepted. `tpPct` / `slPct` are optional PnL-percentage thresholds; `tpPrice` / `slPrice` are optional absolute pool-price thresholds (quote per base token). Do not set both modes for the same side in one object. Every configured wallet is scanned each tick.
 
 ### `config/lp-targets.json`
 
@@ -61,11 +62,12 @@ Per-position overrides. Managed automatically by `/lp set` and `/lp unset`:
 
 ```json
 {
-  "<positionAddress>": { "tpPct": 35, "slPct": 12 }
+  "<positionAddress>": { "tpPct": 35, "slPct": 12 },
+  "<anotherPosition>": { "tpPrice": 0.0001917, "slPrice": 0.0001620 }
 }
 ```
 
-Threshold resolution order: **per-position override → wallet override → `config/app.json` defaults**.
+Threshold resolution order per side: **per-position override → wallet override → `config/app.json` defaults**. A configured price replaces the percentage for that side. Via Telegram, `/set` auto-detects: `20` / `12.5%` → PnL percent, `0.0001917` → pool price. Use `price:2.5` to force a price target ≥ 1 and `0.5%` to force a sub-1 percentage.
 
 ## Runtime settings (`config/app.json`)
 
@@ -115,6 +117,7 @@ Arm a position to have it closed automatically when a threshold is hit:
 
 ```
 /close 1 tp 10 sl 20   # close #1 at +10% or -20%
+/close 1 tp 0.0001917  # close #1 when pool price reaches 0.0001917
 /close 1               # use the position's current TP/SL
 /close list            # status, attempts, next retry, last error
 /close off 1           # disarm
@@ -123,11 +126,11 @@ Arm a position to have it closed automatically when a threshold is hit:
 When triggered, the executor:
 
 1. Removes **100%** of the position's liquidity and claims fees + LM rewards, closing the position.
-2. Reads every resulting token balance (including reward tokens) and swaps it to SOL through Jupiter at `executor.slippageBps`.
+2. Reads every resulting token balance (including reward tokens) and swaps it to SOL through Jupiter Router `/build` and `tx.jup.ag` at `executor.slippageBps`. Each swap transaction requires a minimum `0.001 SOL` Jupiter tip.
 3. Unwraps any WSOL and verifies no token balances remain.
 4. Sends a Telegram receipt with transaction links.
 
-Failures are retried with exponential backoff. Orders live in `close-state.json`, so a crash or restart resumes armed orders automatically. If a position disappears (closed manually), the order is marked done after a few ticks.
+Orders may use PnL percentages or absolute pool-price thresholds (the same auto-detection as `/set`), and both modes are persisted in `close-state.json`. Failures are retried with exponential backoff, so a crash or restart resumes armed orders automatically. If a position disappears (closed manually), the order is marked done after a few ticks.
 
 **Safety rules:**
 
@@ -146,12 +149,12 @@ npm run test-close -- --execute  # real close for orders currently in TP/SL
 |---|---|
 | `/lp` or `/lp list` | List detected positions with numbers (`#1`, `#2` …), PnL, thresholds, range status |
 | `/status [number]` or `/lp status [number]` | Detailed status for one position, or all positions when the number is omitted |
-| `/lp set <#\|position> [tp <pct>] [sl <pct>]` | Set per-position overrides, e.g. `/lp set 1 tp 20 sl 10` |
-| `/lp set <tp\|sl> <#\|position> <pct>` | Alternate order, e.g. `/lp set sl 1 20%` |
-| `/set <tp\|sl> <#\|position> <pct>` | Shorthand, e.g. `/set sl 1 20%` |
+| `/lp set <#\|position> [tp <pct\|price>] [sl <pct\|price>]` | Set per-position overrides, e.g. `/lp set 1 tp 20 sl 10` or `/lp set 1 tp 0.0001917` |
+| `/lp set <tp\|sl> <#\|position> <pct\|price>` | Alternate order, e.g. `/lp set sl 1 20%` |
+| `/set <tp\|sl> <#\|position> <pct\|price>` | Shorthand, e.g. `/set sl 1 20%` or `/set tp 1 0.0001917` |
 | `/lp unset <#\|position>` | Remove an override; wallet/default thresholds apply |
 | `/lp reload` | Reload wallets + overrides from disk |
-| `/close <#\|position> [tp <pct>] [sl <pct>]` | Arm auto-close, e.g. `/close 1 tp 10 sl 20` |
+| `/close <#\|position> [tp <pct\|price>] [sl <pct\|price>]` | Arm auto-close, e.g. `/close 1 tp 10 sl 20` or `/close 1 tp 0.0001917` |
 | `/close list` | Show armed orders, attempts, next retry, last error |
 | `/close off <#\|position>` | Disarm an auto-close order |
 

@@ -7,7 +7,13 @@ import {
   type CloseOrder,
   type CloseState,
 } from "./close-state";
-import type { LpSnapshotEntry } from "./lp";
+import {
+  formatThresholdSummary,
+  thresholdBreached,
+  type LpSnapshotEntry,
+  type ResolvedThreshold,
+  type ThresholdKind,
+} from "./lp";
 
 const MISSING_TICKS_BEFORE_DONE = 4;
 
@@ -18,6 +24,8 @@ export interface CloseArmParams {
   number?: number;
   tpPct?: number;
   slPct?: number;
+  tpPrice?: number;
+  slPrice?: number;
 }
 
 export interface CloseExecutorDeps {
@@ -60,6 +68,30 @@ function label(order: CloseOrder): string {
   return order.number ? `#${order.number}` : "order";
 }
 
+function assertThreshold(kind: ThresholdKind, pct: number | undefined, price: number | undefined): void {
+  if (pct !== undefined && (!Number.isFinite(pct) || pct < 0)) {
+    throw new Error(`${kind}Pct must be a non-negative number`);
+  }
+  if (price !== undefined && (!Number.isFinite(price) || price <= 0)) {
+    throw new Error(`${kind}Price must be a positive number`);
+  }
+  if (pct !== undefined && price !== undefined) {
+    throw new Error(`${kind} cannot use both a percentage and a price`);
+  }
+}
+
+function resolveOrderThreshold(
+  orderPrice: number | undefined,
+  orderPct: number | undefined,
+  rowPrice: number | null,
+  rowPct: number,
+): ResolvedThreshold {
+  if (orderPrice !== undefined) return { pct: 0, price: orderPrice };
+  if (orderPct !== undefined) return { pct: orderPct, price: null };
+  if (rowPrice !== null) return { pct: 0, price: rowPrice };
+  return { pct: rowPct, price: null };
+}
+
 function backoffMs(config: CloseConfig, attempts: number): number {
   const exponent = Math.max(0, attempts - 1);
   const delay = config.retryBaseMs * 2 ** Math.min(exponent, 30);
@@ -82,8 +114,16 @@ function successMessage(
     for (const swap of result.swaps) {
       lines.push(`• ${swap.mint.slice(0, 4)}…${swap.mint.slice(-4)} → ${formatSol(swap.outAmount)}`);
     }
-  } else {
+  } else if (result.skipped.length === 0) {
     lines.push("No token balances needed swapping.");
+  }
+
+  if (result.skipped.length > 0) {
+    lines.push(
+      `Left unsold: ${result.skipped
+        .map((row) => `${row.mint.slice(0, 4)}…${row.mint.slice(-4)}=${row.amount} (${row.reason})`)
+        .join(", ")}`,
+    );
   }
 
   if (result.signatures.length > 0) {
@@ -117,9 +157,8 @@ export function startCloseExecutor(
   const runOrder = async (
     order: CloseOrder,
     row: LpSnapshotEntry,
-    reason: "tp" | "sl",
-    tpPct: number,
-    slPct: number,
+    reason: ThresholdKind,
+    threshold: ResolvedThreshold,
   ): Promise<void> => {
     order.status = "executing";
     order.attempts += 1;
@@ -127,7 +166,7 @@ export function startCloseExecutor(
     order.nextAttemptAt = undefined;
     saveState(state);
 
-    const reasonText = reason === "tp" ? `TP +${tpPct}%` : `SL -${slPct}%`;
+    const reasonText = formatThresholdSummary(reason, threshold.pct, threshold.price);
     log(
       `Executing close for ${label(order)} (${reasonText}, PnL ${(row.pnlPct ?? 0).toFixed(2)}%)`,
     );
@@ -191,8 +230,16 @@ export function startCloseExecutor(
     let changed = false;
 
     for (const order of Object.values(state)) {
-      if (order.status === "done") continue;
+      if (order.status === "done" || order.status === "failed") continue;
       if (order.status === "executing") order.status = "armed";
+
+      if (order.wallet !== config.owner) {
+        order.status = "failed";
+        order.lastError = `position wallet ${order.wallet} does not match executor ${config.owner}`;
+        changed = true;
+        log(`Close order ${label(order)} disabled: ${order.lastError}`);
+        continue;
+      }
 
       if (order.nextAttemptAt) {
         const at = new Date(order.nextAttemptAt).getTime();
@@ -220,15 +267,13 @@ export function startCloseExecutor(
         changed = true;
       }
 
-      if (row.pnlPct === null) continue;
-
-      const tpPct = order.tpPct ?? row.tpPct;
-      const slPct = order.slPct ?? row.slPct;
-      const tpHit = tpPct > 0 && row.pnlPct >= tpPct;
-      const slHit = slPct > 0 && row.pnlPct <= -slPct;
+      const tp = resolveOrderThreshold(order.tpPrice, order.tpPct, row.tpPrice, row.tpPct);
+      const sl = resolveOrderThreshold(order.slPrice, order.slPct, row.slPrice, row.slPct);
+      const tpHit = thresholdBreached("tp", tp.pct, tp.price, row);
+      const slHit = thresholdBreached("sl", sl.pct, sl.price, row);
       if (!tpHit && !slHit) continue;
 
-      await runOrder(order, row, tpHit ? "tp" : "sl", tpPct, slPct);
+      await runOrder(order, row, tpHit ? "tp" : "sl", tpHit ? tp : sl);
       changed = true;
     }
 
@@ -273,14 +318,27 @@ export function startCloseExecutor(
           `position wallet ${params.wallet} does not match executor ${config.owner}`,
         );
       }
+      assertThreshold("tp", params.tpPct, params.tpPrice);
+      assertThreshold("sl", params.slPct, params.slPrice);
       const existing = state[params.position];
+      let tpPct = params.tpPct ?? existing?.tpPct;
+      let slPct = params.slPct ?? existing?.slPct;
+      let tpPrice = params.tpPrice ?? existing?.tpPrice;
+      let slPrice = params.slPrice ?? existing?.slPrice;
+      if (params.tpPrice !== undefined) tpPct = undefined;
+      if (params.tpPct !== undefined) tpPrice = undefined;
+      if (params.slPrice !== undefined) slPct = undefined;
+      if (params.slPct !== undefined) slPrice = undefined;
+
       const order: CloseOrder = {
         position: params.position,
         pool: params.pool,
         wallet: params.wallet,
         number: params.number,
-        tpPct: params.tpPct ?? existing?.tpPct,
-        slPct: params.slPct ?? existing?.slPct,
+        tpPct,
+        slPct,
+        tpPrice,
+        slPrice,
         armedAt: new Date().toISOString(),
         status: "armed",
         attempts: 0,
@@ -288,7 +346,9 @@ export function startCloseExecutor(
       state[params.position] = order;
       saveState(state);
       log(
-        `Armed close for ${label(order)} · TP ${order.tpPct ?? "—"}% / SL ${order.slPct ?? "—"}%`,
+        `Armed close for ${label(order)} · ` +
+          `${formatThresholdSummary("tp", order.tpPct ?? 0, order.tpPrice ?? null)} / ` +
+          `${formatThresholdSummary("sl", order.slPct ?? 0, order.slPrice ?? null)}`,
       );
       return { ...order };
     },

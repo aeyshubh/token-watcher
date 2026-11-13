@@ -1,11 +1,13 @@
 import {
+  AddressLookupTableAccount,
   ComputeBudgetProgram,
   Connection,
   Keypair,
   PublicKey,
   Transaction,
+  TransactionInstruction,
+  TransactionMessage,
   VersionedTransaction,
-  type TransactionInstruction,
 } from "@solana/web3.js";
 import {
   closeAccount,
@@ -15,22 +17,41 @@ import {
 } from "@solana/spl-token";
 import DLMM from "@meteora-ag/dlmm";
 import BN from "bn.js";
-import { getQuote, getSwapTransaction } from "./jupiter";
+import { base58Encode } from "./solana";
+import {
+  type ApiInstruction,
+  getSwapBuild,
+  type JupiterBuildResponse,
+  JUPITER_TIP_LAMPORTS,
+  JUPITER_TX_HOST,
+} from "./jupiter";
 
 const WSOL = NATIVE_MINT.toBase58();
 const BPS_DENOMINATOR = 10_000;
+const BASE_FEE_LAMPORTS = 5_000;
+const COMPUTE_BUDGET_PROGRAM_BASE58 = "ComputeBudget111111111111111111111111111111";
 
 export interface CloseSwapRecord {
   mint: string;
   inAmount: string;
   outAmount: string;
+  minOutAmount: string | null;
+  priceImpactPct: string | null;
+  routeLabels: string[];
   signature: string;
+}
+
+export interface SkippedSwap {
+  mint: string;
+  amount: string;
+  reason: string;
 }
 
 export interface CloseResult {
   positionClosed: boolean;
   signatures: string[];
   swaps: CloseSwapRecord[];
+  skipped: SkippedSwap[];
   remaining: Array<{ mint: string; amount: string }>;
 }
 
@@ -115,20 +136,146 @@ async function sendLegacy(
   return signature;
 }
 
-async function sendVersioned(
+function toInstruction(ix: ApiInstruction): TransactionInstruction {
+  return new TransactionInstruction({
+    programId: new PublicKey(ix.programId),
+    keys: ix.accounts.map((acc) => ({
+      pubkey: new PublicKey(acc.pubkey),
+      isSigner: acc.isSigner,
+      isWritable: acc.isWritable,
+    })),
+    data: Buffer.from(ix.data, "base64"),
+  });
+}
+
+function transformAltAccounts(raw: Record<string, string[]> | null): AddressLookupTableAccount[] {
+  if (!raw) return [];
+  return Object.entries(raw).map(([key, addrs]) =>
+    new AddressLookupTableAccount({
+      key: new PublicKey(key),
+      state: {
+        deactivationSlot: BigInt("18446744073709551615"),
+        lastExtendedSlot: 0,
+        lastExtendedSlotStartIndex: 0,
+        addresses: addrs.map((addr) => new PublicKey(addr)),
+      },
+    }),
+  );
+}
+
+function clampComputeUnitPrice(
+  instructions: ApiInstruction[],
+  estimatedCU: number,
+  capLamports: number,
+): TransactionInstruction | null {
+  if (capLamports <= 0) return null;
+  const maxUnitPrice = Math.floor((capLamports * 1_000_000) / Math.max(1, estimatedCU));
+  const computeBudget = COMPUTE_BUDGET_PROGRAM_BASE58;
+
+  for (const ix of instructions) {
+    if (ix.programId !== computeBudget) continue;
+    const data = Buffer.from(ix.data, "base64");
+    if (data.length < 9) continue;
+    if (data[0] === 2) continue;
+    if (data[0] === 3) {
+      const price = Number(data.readBigUInt64LE(1));
+      if (!Number.isFinite(price) || price <= 0) continue;
+      const clamped = Math.min(price, maxUnitPrice);
+      if (clamped <= 0) continue;
+      const out = Buffer.alloc(9);
+      out.writeUInt8(3, 0);
+      out.writeBigUInt64LE(BigInt(clamped), 1);
+      return new TransactionInstruction({
+        programId: new PublicKey(ix.programId),
+        keys: [],
+        data: out,
+      });
+    }
+  }
+
+  return null;
+}
+
+async function sendVersionedViaJupiter(
+  swapConnection: Connection,
   connection: Connection,
   tx: VersionedTransaction,
   lastValidBlockHeight: number,
 ): Promise<string> {
-  const signature = await connection.sendRawTransaction(tx.serialize(), {
-    skipPreflight: false,
-    maxRetries: 5,
+  const signature = await swapConnection.sendRawTransaction(tx.serialize(), {
+    skipPreflight: true,
+    maxRetries: 0,
   });
   await connection.confirmTransaction(
     { signature, blockhash: tx.message.recentBlockhash, lastValidBlockHeight },
     "confirmed",
   );
   return signature;
+}
+
+async function executeSwap(
+  connection: Connection,
+  swapConnection: Connection,
+  keypair: Keypair,
+  build: JupiterBuildResponse,
+  priorityFeeCapLamports: number,
+  computeUnitLimit: number,
+): Promise<string> {
+  const blockhash = base58Encode(Uint8Array.from(build.blockhashWithMetadata.blockhash));
+  const altAccounts = transformAltAccounts(build.addressesByLookupTableAddress);
+  const instructions = [
+    ...build.setupInstructions.map(toInstruction),
+    toInstruction(build.swapInstruction),
+    ...(build.cleanupInstruction ? [toInstruction(build.cleanupInstruction)] : []),
+    ...build.otherInstructions.map(toInstruction),
+    toInstruction(build.tipInstruction!),
+  ];
+
+  const simulationMessage = new TransactionMessage({
+    payerKey: keypair.publicKey,
+    recentBlockhash: blockhash,
+    instructions: [
+      ComputeBudgetProgram.setComputeUnitLimit({ units: computeUnitLimit }),
+      ...instructions,
+    ],
+  }).compileToV0Message(altAccounts);
+
+  const simulation = await connection.simulateTransaction(
+    new VersionedTransaction(simulationMessage),
+    { sigVerify: false, replaceRecentBlockhash: true },
+  );
+
+  if (simulation.value.err) {
+    throw new Error(
+      `Swap simulation failed for ${build.inputMint}->${build.outputMint}: ${String(
+        simulation.value.err,
+      )}`,
+    );
+  }
+
+  const unitsConsumed = simulation.value.unitsConsumed;
+  const estimatedCU = unitsConsumed
+    ? Math.min(Math.ceil(unitsConsumed * 1.2), computeUnitLimit)
+    : computeUnitLimit;
+  const priceInstruction = clampComputeUnitPrice(
+    build.computeBudgetInstructions,
+    estimatedCU,
+    priorityFeeCapLamports,
+  );
+
+  const finalMessage = new TransactionMessage({
+    payerKey: keypair.publicKey,
+    recentBlockhash: blockhash,
+    instructions: [
+      ComputeBudgetProgram.setComputeUnitLimit({ units: estimatedCU }),
+      ...(priceInstruction ? [priceInstruction] : []),
+      ...instructions,
+    ],
+  }).compileToV0Message(altAccounts);
+
+  const tx = new VersionedTransaction(finalMessage);
+  tx.sign([keypair]);
+  return sendVersionedViaJupiter(swapConnection, connection, tx, build.blockhashWithMetadata.lastValidBlockHeight);
 }
 
 async function tokenBalance(
@@ -178,7 +325,8 @@ async function unwrapWsol(connection: Connection, keypair: Keypair): Promise<str
 
 /**
  * Remove 100% of a DLMM position (claiming fees + rewards and closing it),
- * then swap every resulting token balance to SOL at the configured slippage.
+ * then swap every resulting token balance to SOL via Jupiter /build (Metis routing)
+ * and tx.jup.ag submission.
  */
 export async function executeClose(params: CloseParams): Promise<CloseResult> {
   const {
@@ -192,10 +340,20 @@ export async function executeClose(params: CloseParams): Promise<CloseResult> {
   } = params;
   const log = params.log ?? (() => undefined);
 
+  const jupiterApiKey = process.env.JUPITER_API_KEY?.trim();
+  if (!jupiterApiKey) {
+    throw new Error("Missing required environment variable: JUPITER_API_KEY");
+  }
+  const swapConnection = new Connection(JUPITER_TX_HOST, {
+    httpHeaders: { "x-api-key": jupiterApiKey },
+  });
+
   const poolPubkey = new PublicKey(pool);
   const positionPubkey = new PublicKey(position);
   const signatures: string[] = [];
   const swaps: CloseSwapRecord[] = [];
+  const skipped: SkippedSwap[] = [];
+  const skippedSet = new Set<string>();
 
   const dlmm = await DLMM.create(connection, poolPubkey);
 
@@ -249,38 +407,58 @@ export async function executeClose(params: CloseParams): Promise<CloseResult> {
     if (reward) mints.add(reward.mint.address.toBase58());
   }
 
-  const skipped = new Set<string>();
-
   for (const mint of mints) {
     if (mint === WSOL) continue;
     const amount = await tokenBalance(connection, keypair.publicKey, mint);
     if (amount <= 0n) continue;
 
     log(`Swapping ${amount.toString()} of ${mint} to SOL`);
-    const quote = await getQuote({ inputMint: mint, outputMint: WSOL, amount, slippageBps });
-    if (!quote || quote.outAmount === "0") {
+    const build = await getSwapBuild({
+      inputMint: mint,
+      outputMint: WSOL,
+      amount,
+      slippageBps,
+      taker: keypair.publicKey.toBase58(),
+    });
+
+    if (build.outAmount === "0") {
       log(`No swap route or dust for ${mint}; leaving balance`);
-      skipped.add(mint);
+      skippedSet.add(mint);
+      skipped.push({ mint, amount: amount.toString(), reason: "no output" });
       continue;
     }
 
-    const swap = await getSwapTransaction({
-      quote,
-      userPublicKey: keypair.publicKey.toBase58(),
-      priorityFeeCapLamports,
-    });
-    const tx = VersionedTransaction.deserialize(Buffer.from(swap.swapTransaction, "base64"));
-    tx.sign([keypair]);
+    const outAmount = BigInt(build.outAmount);
+    const tipPlusBase = BigInt(JUPITER_TIP_LAMPORTS + BASE_FEE_LAMPORTS);
+    if (outAmount <= tipPlusBase) {
+      log(`Swap value ${build.outAmount} below tip+fee for ${mint}; leaving balance`);
+      skippedSet.add(mint);
+      skipped.push({ mint, amount: amount.toString(), reason: "below tip+fee" });
+      continue;
+    }
 
-    const signature = await sendVersioned(connection, tx, swap.lastValidBlockHeight);
+    const signature = await executeSwap(
+      connection,
+      swapConnection,
+      keypair,
+      build,
+      priorityFeeCapLamports,
+      computeUnitLimit,
+    );
     signatures.push(signature);
     swaps.push({
       mint,
-      inAmount: quote.inAmount,
-      outAmount: quote.outAmount,
+      inAmount: build.inAmount,
+      outAmount: build.outAmount,
+      minOutAmount: build.otherAmountThreshold ?? null,
+      priceImpactPct: build.priceImpactPct ?? null,
+      routeLabels: (build.routePlan ?? []).map((route) => route.swapInfo.label),
       signature,
     });
-    log(`Swapped ${mint}: ${quote.inAmount} -> ${quote.outAmount} SOL (${signature})`);
+    log(
+      `Swapped ${mint}: ${build.inAmount} -> ${build.outAmount} WSOL ` +
+        `(min ${build.otherAmountThreshold ?? "n/a"} impact ${build.priceImpactPct ?? "n/a"}) ${signature}`,
+    );
   }
 
   const unwrapSignature = await unwrapWsol(connection, keypair);
@@ -291,7 +469,7 @@ export async function executeClose(params: CloseParams): Promise<CloseResult> {
 
   const remaining: Array<{ mint: string; amount: string }> = [];
   for (const mint of mints) {
-    if (mint === WSOL || skipped.has(mint)) continue;
+    if (mint === WSOL || skippedSet.has(mint)) continue;
     const amount = await tokenBalance(connection, keypair.publicKey, mint);
     if (amount > 0n) remaining.push({ mint, amount: amount.toString() });
   }
@@ -302,5 +480,5 @@ export async function executeClose(params: CloseParams): Promise<CloseResult> {
     );
   }
 
-  return { positionClosed, signatures, swaps, remaining };
+  return { positionClosed, signatures, swaps, skipped, remaining };
 }

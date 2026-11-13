@@ -26,3 +26,26 @@ export function base58Decode(input: string): Uint8Array {
   for (let i = 0; i < input.length && input[i] === "1"; i += 1) bytes.push(0);
   return Uint8Array.from(bytes.reverse());
 }
+
+export function base58Encode(input: Uint8Array): string {
+  if (input.length === 0) return "";
+  let zeros = 0;
+  while (zeros < input.length && input[zeros] === 0) zeros += 1;
+  if (zeros === input.length) return "1".repeat(zeros);
+
+  let digits = [0];
+  for (let i = zeros; i < input.length; i += 1) {
+    let carry = input[i];
+    for (let j = 0; j < digits.length; j += 1) {
+      carry += digits[j] << 8;
+      digits[j] = carry % 58;
+      carry = Math.floor(carry / 58);
+    }
+    while (carry > 0) {
+      digits.push(carry % 58);
+      carry = Math.floor(carry / 58);
+    }
+  }
+
+  return "1".repeat(zeros) + digits.reverse().map((digit) => ALPHABET[digit]).join("");
+}

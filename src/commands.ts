@@ -1,10 +1,14 @@
-import { formatUsd } from "./format";
+import { formatPrice, formatUsd } from "./format";
 import { isBase58 } from "./solana";
 import {
   formatPositionStatus,
   formatThresholdHit,
+  formatThresholdSummary,
+  thresholdBreached,
+  type LpSnapshotEntry,
   type LpTarget,
   type LpTrackerHandle,
+  type ThresholdKind,
 } from "./lp";
 import type { CloseExecutorHandle } from "./executor";
 
@@ -23,8 +27,8 @@ export interface BotCommand {
 export const BOT_COMMANDS: BotCommand[] = [
   { command: "lp", description: "LP positions (#1, #2 …) + TP/SL: /lp [list|status|set|unset|reload]" },
   { command: "status", description: "Detailed LP status: /status [number] (omit number for all)" },
-  { command: "set", description: "Set LP TP/SL by number: /set sl 1 20% or /set 1 tp 20 sl 10" },
-  { command: "close", description: "Auto-close on TP/SL: /close <#> [tp <pct>] [sl <pct>] · /close list · /close off <#>" },
+  { command: "set", description: "Set LP TP/SL: /set sl 1 20% (PnL) or /set tp 1 0.0001917 (price)" },
+  { command: "close", description: "Auto-close on TP/SL: /close <#|position> [tp <pct|price>] [sl <pct|price>] · /close list · /close off <#>" },
   { command: "help", description: "Show all commands" },
   { command: "start", description: "Show all commands" },
 ];
@@ -33,20 +37,47 @@ const HELP = [
   "tokenWatcher commands:",
   "/lp  — list auto-detected LP positions with numbers (#1, #2 …)",
   "/status [number]  — detailed LP status (all positions if number omitted)",
-  "/lp set <#|position> [tp <pct>] [sl <pct>]  — e.g. /lp set 1 tp 20 sl 10",
-  "/set <tp|sl> <#|position> <pct>  — e.g. /set sl 1 20%",
+  "/lp set <#|position> [tp <pct|price>] [sl <pct|price>]  — e.g. /lp set 1 tp 20 sl 10",
+  "/set <tp|sl> <#|position> <pct|price>  — e.g. /set sl 1 20% · /set tp 1 0.0001917",
+  "  prices use pool price (quote per token); use price:<n> to force price, <n>% to force PnL %",
   "/lp unset <#|position>  — remove an override",
   "/lp reload  — reload wallets + overrides from disk",
-  "/close <#> [tp <pct>] [sl <pct>]  — arm auto-close, e.g. /close 1 tp 10 sl 20",
+  "/close <#|position> [tp <pct|price>] [sl <pct|price>]  — e.g. /close 1 tp 10 sl 20",
   "/close list  — show armed auto-close orders",
   "/close off <#>  — disarm an auto-close order",
   "/help  — this message",
 ].join("\n");
 
-function parsePercent(raw: string | undefined): number | null {
+export interface ParsedThreshold {
+  pct?: number;
+  price?: number;
+}
+
+/**
+ * Parse a TP/SL value.
+ * - `price:<n>` always means pool price (must be > 0).
+ * - `<n>%` always means PnL percent.
+ * - A positive value below 1 (e.g. 0.0001917) is treated as pool price.
+ * - Everything else is treated as PnL percent.
+ */
+export function parseThresholdValue(raw: string | undefined): ParsedThreshold | null {
   if (raw === undefined) return null;
-  const value = Number(raw.replace(/%$/, ""));
-  return Number.isFinite(value) && value >= 0 ? value : null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+
+  const forcePrice = /^price:/i.test(trimmed);
+  const forcePct = trimmed.endsWith("%");
+  const numeric = trimmed.replace(/^price:/i, "").replace(/%$/, "").trim();
+  if (!numeric) return null;
+  if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(numeric)) return null;
+
+  const value = Number(numeric);
+  if (!Number.isFinite(value) || value < 0) return null;
+
+  if (forcePrice) return value > 0 ? { price: value } : null;
+  if (forcePct) return { pct: value };
+  if (value > 0 && value < 1) return { price: value };
+  return { pct: value };
 }
 
 function isPositionRef(token: string): boolean {
@@ -62,8 +93,8 @@ function parseLpSetArgs(
   if (clean.length === 0) {
     return {
       error:
-        "Usage: /lp set <#|position> [tp <pct>] [sl <pct>]\n" +
-        "Examples: /lp set 1 tp 20 sl 10 · /lp set sl 1 20%",
+        "Usage: /lp set <#|position> [tp <pct|price>] [sl <pct|price>]\n" +
+        "Examples: /lp set 1 tp 20 sl 10 · /lp set sl 1 20% · /lp set tp 1 0.0001917",
     };
   }
 
@@ -82,7 +113,7 @@ function parseLpSetArgs(
     return {
       error:
         "Could not find a position number or address.\n" +
-        "Usage: /lp set <#|position> [tp <pct>] [sl <pct>]",
+        "Usage: /lp set <#|position> [tp <pct|price>] [sl <pct|price>]",
     };
   }
 
@@ -91,19 +122,30 @@ function parseLpSetArgs(
     const field = rest[i]?.toLowerCase();
     const raw = rest[i + 1];
     if (field !== "tp" && field !== "sl") {
-      return { error: `Unknown field "${rest[i]}". Use tp <pct> and/or sl <pct>.` };
+      return { error: `Unknown field "${rest[i]}". Use tp <pct|price> and/or sl <pct|price>.` };
     }
-    const value = parsePercent(raw);
-    if (value === null) {
+    const parsed = parseThresholdValue(raw);
+    if (!parsed) {
       return { error: `Invalid ${field} value "${raw ?? ""}".` };
     }
-    if (field === "tp") target.tpPct = value;
-    else target.slPct = value;
+    if (field === "tp") {
+      if (parsed.price !== undefined) target.tpPrice = parsed.price;
+      else target.tpPct = parsed.pct;
+    } else {
+      if (parsed.price !== undefined) target.slPrice = parsed.price;
+      else target.slPct = parsed.pct;
+    }
   }
 
-  if (requireTarget && target.tpPct === undefined && target.slPct === undefined) {
+  if (
+    requireTarget &&
+    target.tpPct === undefined &&
+    target.tpPrice === undefined &&
+    target.slPct === undefined &&
+    target.slPrice === undefined
+  ) {
     return {
-      error: "Nothing to set. Usage: /lp set <#|position> [tp <pct>] [sl <pct>]",
+      error: "Nothing to set. Usage: /lp set <#|position> [tp <pct|price>] [sl <pct|price>]",
     };
   }
 
@@ -145,6 +187,27 @@ function resolveCloseRef(
   return resolved;
 }
 
+interface EffectiveThreshold {
+  pct: number;
+  price: number | null;
+  changed: boolean;
+}
+
+function effectiveThreshold(
+  target: LpTarget | undefined,
+  row: LpSnapshotEntry | undefined,
+  kind: ThresholdKind,
+): EffectiveThreshold {
+  const targetPrice = kind === "tp" ? target?.tpPrice : target?.slPrice;
+  const targetPct = kind === "tp" ? target?.tpPct : target?.slPct;
+  if (targetPrice !== undefined) return { pct: 0, price: targetPrice, changed: true };
+  if (targetPct !== undefined) return { pct: targetPct, price: null, changed: true };
+
+  const rowPrice = kind === "tp" ? row?.tpPrice ?? null : row?.slPrice ?? null;
+  const rowPct = kind === "tp" ? row?.tpPct ?? 0 : row?.slPct ?? 0;
+  return { pct: rowPct, price: rowPrice, changed: false };
+}
+
 async function applyLpSet(
   args: string[],
   tracker: LpTrackerHandle,
@@ -165,20 +228,29 @@ async function applyLpSet(
   const row = tracker.snapshot().find((entry) => entry.position === resolved);
   tracker.setTarget(resolved, parsed.target);
   const label = refLabel(parsed.ref, resolved);
+  const tp = effectiveThreshold(parsed.target, row, "tp");
+  const sl = effectiveThreshold(parsed.target, row, "sl");
   const lines = [`✅ Override saved for ${label}`];
   lines.push(
-    `${parsed.target.tpPct !== undefined ? `TP +${parsed.target.tpPct}%` : "TP unchanged"} · ` +
-      `${parsed.target.slPct !== undefined ? `SL -${parsed.target.slPct}%` : "SL unchanged"}`,
+    `${tp.changed ? formatThresholdSummary("tp", tp.pct, tp.price) : "TP unchanged"} · ` +
+      `${sl.changed ? formatThresholdSummary("sl", sl.pct, sl.price) : "SL unchanged"}`,
   );
 
   if (!row) {
     lines.push("Hit prices: n/a (position not in latest snapshot)");
   } else {
-    const tpPct = parsed.target.tpPct ?? row.tpPct;
-    const slPct = parsed.target.slPct ?? row.slPct;
-    const tpLine = formatThresholdHit(row, "tp", tpPct);
+    if (tp.price !== null || sl.price !== null) {
+      lines.push(`Current price: ${row.activePrice === null ? "n/a" : formatPrice(row.activePrice)}`);
+    }
+    if (thresholdBreached("tp", tp.pct, tp.price, row)) {
+      lines.push("⚠️ TP target is already breached — it will trigger on the next tick.");
+    }
+    if (thresholdBreached("sl", sl.pct, sl.price, row)) {
+      lines.push("⚠️ SL target is already breached — it will trigger on the next tick.");
+    }
+    const tpLine = formatThresholdHit(row, "tp", tp.pct, tp.price);
     if (tpLine) lines.push(tpLine);
-    const slLine = formatThresholdHit(row, "sl", slPct);
+    const slLine = formatThresholdHit(row, "sl", sl.pct, sl.price);
     if (slLine) lines.push(slLine);
   }
 
@@ -260,11 +332,12 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
           const parts = [
             `#${row.number} · ${row.poolName} · ${row.walletLabel}`,
             `  PnL ${pnl} · Bal ${formatUsd(row.balances)} · ${status}`,
-            `  TP +${row.tpPct}% / SL -${row.slPct}%`,
+            `  ${formatThresholdSummary("tp", row.tpPct, row.tpPrice)} / ` +
+              `${formatThresholdSummary("sl", row.slPct, row.slPrice)}`,
           ];
-          const tpHit = formatThresholdHit(row, "tp", row.tpPct);
+          const tpHit = formatThresholdHit(row, "tp", row.tpPct, row.tpPrice);
           if (tpHit) parts.push(`  ${tpHit}`);
-          const slHit = formatThresholdHit(row, "sl", row.slPct);
+          const slHit = formatThresholdHit(row, "sl", row.slPct, row.slPrice);
           if (slHit) parts.push(`  ${slHit}`);
           return parts.join("\n");
         });
@@ -313,8 +386,8 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
         "LP tracker commands:\n" +
           "/lp  — list detected positions with numbers (#1, #2 …)\n" +
           "/status [number]  — detailed status\n" +
-          "/lp set <#|position> [tp <pct>] [sl <pct>]\n" +
-          "/set <tp|sl> <#|position> <pct>\n" +
+          "/lp set <#|position> [tp <pct|price>] [sl <pct|price>]\n" +
+          "/set <tp|sl> <#|position> <pct|price>\n" +
           "/lp unset <#|position>\n" +
           "/lp reload",
       );
@@ -368,14 +441,14 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
           await reply(
             doneCount > 0
               ? `No active auto-close orders (${doneCount} completed).`
-              : "No auto-close orders armed. Use /close <#> [tp <pct>] [sl <pct>].",
+              : "No auto-close orders armed. Use /close <#|position> [tp <pct|price>] [sl <pct|price>].",
           );
           return;
         }
         const lines = active.map((order) => {
           const ref = order.number ? `#${order.number}` : "order";
-          const tp = order.tpPct !== undefined ? `+${order.tpPct}%` : "—";
-          const sl = order.slPct !== undefined ? `-${order.slPct}%` : "—";
+          const tp = formatThresholdSummary("tp", order.tpPct ?? 0, order.tpPrice ?? null);
+          const sl = formatThresholdSummary("sl", order.slPct ?? 0, order.slPrice ?? null);
           const retry =
             order.nextAttemptAt && order.status === "armed"
               ? `\n  next retry: ${order.nextAttemptAt}`
@@ -383,7 +456,7 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
           const error = order.lastError ? `\n  last error: ${order.lastError}` : "";
           return (
             `${ref} · ${order.status.toUpperCase()}\n` +
-            `  TP ${tp} / SL ${sl} · attempts ${order.attempts}${retry}${error}`
+            `  ${tp} / ${sl} · attempts ${order.attempts}${retry}${error}`
           );
         });
         const suffix = doneCount > 0 ? `\n\nCompleted: ${doneCount}` : "";
@@ -423,8 +496,8 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
       const parsed = parseLpSetArgs(args, { requireTarget: false });
       if ("error" in parsed) {
         await reply(
-          "Usage: /close <#|position> [tp <pct>] [sl <pct>]\n" +
-            "Examples: /close 1 tp 10 sl 20 · /close 2 · /close list · /close off 1",
+          "Usage: /close <#|position> [tp <pct|price>] [sl <pct|price>]\n" +
+            "Examples: /close 1 tp 10 sl 20 · /close 1 tp 0.0001917 · /close 2 · /close list · /close off 1",
         );
         return;
       }
@@ -450,9 +523,9 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
         return;
       }
 
-      const tpPct = parsed.target.tpPct ?? row.tpPct;
-      const slPct = parsed.target.slPct ?? row.slPct;
-      if (tpPct <= 0 && slPct <= 0) {
+      const tp = effectiveThreshold(parsed.target, row, "tp");
+      const sl = effectiveThreshold(parsed.target, row, "sl");
+      if (tp.pct <= 0 && tp.price === null && sl.pct <= 0 && sl.price === null) {
         await reply("Both TP and SL are disabled; nothing would trigger the close.");
         return;
       }
@@ -465,21 +538,27 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
           number: row.number,
           tpPct: parsed.target.tpPct,
           slPct: parsed.target.slPct,
+          tpPrice: parsed.target.tpPrice,
+          slPrice: parsed.target.slPrice,
         });
       } catch (err) {
         await reply(`Could not arm auto-close: ${(err as Error).message}`);
         return;
       }
 
+      const breached: string[] = [];
+      if (thresholdBreached("tp", tp.pct, tp.price, row)) breached.push("TP");
+      if (thresholdBreached("sl", sl.pct, sl.price, row)) breached.push("SL");
+
       await reply(
         [
           `✅ Auto-close armed for ${refLabel(parsed.ref, resolved)}`,
           `${row.poolName} · ${row.walletLabel}`,
-          `Trigger: TP +${tpPct}% / SL -${slPct}%`,
+          `Trigger: ${formatThresholdSummary("tp", tp.pct, tp.price)} / ` +
+            `${formatThresholdSummary("sl", sl.pct, sl.price)}`,
           "On trigger: remove 100% liquidity, claim fees/rewards, swap all to SOL.",
-          row.pnlPct !== null &&
-          ((tpPct > 0 && row.pnlPct >= tpPct) || (slPct > 0 && row.pnlPct <= -slPct))
-            ? `⚠️ Current PnL ${row.pnlPct.toFixed(2)}% already breaches this trigger — closing on the next tick.`
+          breached.length > 0
+            ? `⚠️ ${breached.join(" + ")} already breached at current price/PnL — closing on the next tick.`
             : "",
         ]
           .filter(Boolean)

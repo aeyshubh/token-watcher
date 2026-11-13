@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import {
   fetchOpenPortfolio,
@@ -22,11 +22,15 @@ export interface LpWallet {
   label: string;
   tpPct?: number;
   slPct?: number;
+  tpPrice?: number;
+  slPrice?: number;
 }
 
 export interface LpTarget {
   tpPct?: number;
   slPct?: number;
+  tpPrice?: number;
+  slPrice?: number;
 }
 
 export interface LpConfig {
@@ -68,10 +72,12 @@ export interface LpSnapshotEntry {
   feePerTvl24h: number | null;
   tpPct: number;
   slPct: number;
+  tpPrice: number | null;
+  slPrice: number | null;
   lastSeen: string;
 }
 
-export type LpEventType = "tp" | "sl" | "oor" | "near";
+export type LpEventType = "tp" | "sl" | "oor" | "near" | "half";
 
 export interface LpEvent {
   type: LpEventType;
@@ -98,6 +104,8 @@ export function log(message: string): void {
   console.log(`[${new Date().toISOString()}] ${message}`);
 }
 
+const HALF_CONVERSION_PCT = 50;
+
 function required(name: string): string {
   const value = process.env[name];
   if (!value || !value.trim()) {
@@ -117,6 +125,50 @@ function numberOrNull(value: string | number | null | undefined): number | null 
   return Number.isFinite(n) ? n : null;
 }
 
+function positiveOrNull(value: number | null): number | null {
+  return value !== null && Number.isFinite(value) && value > 0 ? value : null;
+}
+
+export interface ResolvedThreshold {
+  pct: number;
+  price: number | null;
+}
+
+export type ThresholdKind = "tp" | "sl";
+
+function resolveThreshold(
+  override: LpTarget | undefined,
+  wallet: LpWallet,
+  defaultPct: number,
+  kind: ThresholdKind,
+): ResolvedThreshold {
+  const overridePrice = kind === "tp" ? override?.tpPrice : override?.slPrice;
+  const overridePct = kind === "tp" ? override?.tpPct : override?.slPct;
+  const walletPrice = kind === "tp" ? wallet.tpPrice : wallet.slPrice;
+  const walletPct = kind === "tp" ? wallet.tpPct : wallet.slPct;
+
+  if (overridePrice !== undefined) return { pct: 0, price: overridePrice };
+  if (overridePct !== undefined) return { pct: overridePct, price: null };
+  if (walletPrice !== undefined) return { pct: 0, price: walletPrice };
+  if (walletPct !== undefined) return { pct: walletPct, price: null };
+  return { pct: defaultPct, price: null };
+}
+
+export function formatThresholdSummary(
+  kind: ThresholdKind,
+  pct: number,
+  price: number | null,
+): string {
+  const label = kind === "tp" ? "TP" : "SL";
+  if (price !== null && Number.isFinite(price) && price > 0) {
+    return `${label} ${kind === "tp" ? "≥" : "≤"} ${formatPrice(price)}`;
+  }
+  if (Number.isFinite(pct) && pct > 0) {
+    return `${label} ${kind === "tp" ? "+" : "-"}${pct}%`;
+  }
+  return `${label} off`;
+}
+
 function optionalPct(value: unknown, name: string): number | undefined {
   if (value === undefined || value === null || value === "") return undefined;
   const n = Number(value);
@@ -124,6 +176,21 @@ function optionalPct(value: unknown, name: string): number | undefined {
     throw new Error(`${name} must be a non-negative number`);
   }
   return n;
+}
+
+function optionalPrice(value: unknown, name: string): number | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new Error(`${name} must be a positive number`);
+  }
+  return n;
+}
+
+function rejectMixed(kind: "tp" | "sl", pct: number | undefined, price: number | undefined, name: string): void {
+  if (pct !== undefined && price !== undefined) {
+    throw new Error(`${name} cannot set both ${kind}Pct and ${kind}Price`);
+  }
 }
 
 function short(address: string): string {
@@ -162,6 +229,8 @@ export function readLpWallets(path: string = LP_WALLETS_PATH): LpWallet[] {
     let label: string;
     let tpPct: number | undefined;
     let slPct: number | undefined;
+    let tpPrice: number | undefined;
+    let slPrice: number | undefined;
 
     if (typeof raw === "string") {
       address = raw.trim();
@@ -173,6 +242,10 @@ export function readLpWallets(path: string = LP_WALLETS_PATH): LpWallet[] {
         typeof item.label === "string" && item.label.trim() ? item.label.trim() : short(address);
       tpPct = optionalPct(item.tpPct, `${path}[${index}].tpPct`);
       slPct = optionalPct(item.slPct, `${path}[${index}].slPct`);
+      tpPrice = optionalPrice(item.tpPrice, `${path}[${index}].tpPrice`);
+      slPrice = optionalPrice(item.slPrice, `${path}[${index}].slPrice`);
+      rejectMixed("tp", tpPct, tpPrice, `${path}[${index}]`);
+      rejectMixed("sl", slPct, slPrice, `${path}[${index}]`);
     } else {
       throw new Error(`${path}[${index}] must be a wallet address or { address, label } object`);
     }
@@ -182,7 +255,7 @@ export function readLpWallets(path: string = LP_WALLETS_PATH): LpWallet[] {
     }
     if (seen.has(address)) return;
     seen.add(address);
-    wallets.push({ address, label, tpPct, slPct });
+    wallets.push({ address, label, tpPct, slPct, tpPrice, slPrice });
   });
 
   return wallets;
@@ -201,19 +274,24 @@ export function readLpTargets(path: string = LP_TARGETS_PATH): Record<string, Lp
       throw new Error(`${path}: "${position}" is not a valid base58 position address`);
     }
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-      throw new Error(`${path}.${position} must be an object with tpPct / slPct`);
+      throw new Error(`${path}.${position} must be an object with tpPct / slPct / tpPrice / slPrice`);
     }
 
     const item = raw as Record<string, unknown>;
+    const base = `${path}.${position}`;
     const target: LpTarget = {};
-    for (const key of ["tpPct", "slPct"] as const) {
-      if (item[key] === undefined) continue;
-      const value = Number(item[key]);
-      if (!Number.isFinite(value) || value < 0) {
-        throw new Error(`${path}.${position}.${key} must be a non-negative number`);
-      }
-      target[key] = value;
-    }
+
+    const tpPct = optionalPct(item.tpPct, `${base}.tpPct`);
+    const slPct = optionalPct(item.slPct, `${base}.slPct`);
+    const tpPrice = optionalPrice(item.tpPrice, `${base}.tpPrice`);
+    const slPrice = optionalPrice(item.slPrice, `${base}.slPrice`);
+    rejectMixed("tp", tpPct, tpPrice, base);
+    rejectMixed("sl", slPct, slPrice, base);
+
+    if (tpPct !== undefined) target.tpPct = tpPct;
+    if (slPct !== undefined) target.slPct = slPct;
+    if (tpPrice !== undefined) target.tpPrice = tpPrice;
+    if (slPrice !== undefined) target.slPrice = slPrice;
     targets[position] = target;
   }
   return targets;
@@ -221,13 +299,41 @@ export function readLpTargets(path: string = LP_TARGETS_PATH): Record<string, Lp
 
 function writeLpTargets(targets: Record<string, LpTarget>): void {
   mkdirSync(dirname(LP_TARGETS_PATH), { recursive: true });
-  writeFileSync(LP_TARGETS_PATH, `${JSON.stringify(targets, null, 2)}\n`, "utf8");
+  writeFileSync(LP_TARGETS_PATH, `${JSON.stringify(targets, null, 2)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  try {
+    chmodSync(LP_TARGETS_PATH, 0o600);
+  } catch {
+    // Best effort; some filesystems do not support POSIX modes.
+  }
 }
 
 export function setLpTarget(position: string, target: LpTarget): void {
   if (!isBase58(position)) throw new Error("Position must be a valid base58 address");
+  for (const key of ["tpPct", "slPct"] as const) {
+    const value = target[key];
+    if (value !== undefined && (!Number.isFinite(value) || value < 0)) {
+      throw new Error(`${key} must be a non-negative number`);
+    }
+  }
+  for (const key of ["tpPrice", "slPrice"] as const) {
+    const value = target[key];
+    if (value !== undefined && (!Number.isFinite(value) || value <= 0)) {
+      throw new Error(`${key} must be a positive number`);
+    }
+  }
+  rejectMixed("tp", target.tpPct, target.tpPrice, "target");
+  rejectMixed("sl", target.slPct, target.slPrice, "target");
+
   const targets = readLpTargets();
-  targets[position] = { ...targets[position], ...target };
+  const merged: LpTarget = { ...targets[position], ...target };
+  if (target.tpPrice !== undefined) delete merged.tpPct;
+  if (target.tpPct !== undefined) delete merged.tpPrice;
+  if (target.slPrice !== undefined) delete merged.slPct;
+  if (target.slPct !== undefined) delete merged.slPrice;
+  targets[position] = merged;
   writeLpTargets(targets);
 }
 
@@ -359,7 +465,10 @@ function buildEventText(
   position: PositionPnl,
   tpPct: number,
   slPct: number,
+  tpPrice: number | null,
+  slPrice: number | null,
   nearSide: "upper" | "lower" | null = null,
+  halfShare: number | null = null,
 ): string {
   const pnlPct = num(position.pnlPctChange);
   const pnlUsd = num(position.pnlUsd);
@@ -375,7 +484,9 @@ function buildEventText(
         ? "🛑 LP STOP LOSS"
         : type === "near"
           ? "⚠️ LP NEAR RANGE EDGE"
-          : "⚠️ LP OUT OF RANGE";
+          : type === "half"
+            ? "🔄 LP HALF CONVERTED"
+            : "⚠️ LP OUT OF RANGE";
 
   const lines = [
     title,
@@ -383,6 +494,13 @@ function buildEventText(
     `PnL ${formatPct(pnlPct)} (${formatUsd(pnlUsd)})`,
     `Bal ${formatUsd(balances)} · deposit ${formatUsd(deposit)} · fees ${formatUsd(fees)}`,
   ];
+
+  if (type === "half" && halfShare !== null) {
+    const baseUsd = num(position.unrealizedPnl?.balanceTokenX.usd);
+    lines.push(
+      `Base token ${formatPct(halfShare)} of balance (${formatUsd(baseUsd)} / ${formatUsd(balances)})`,
+    );
+  }
 
   if (type === "oor") lines.push(rangeLabel(range));
   if (type === "near" && nearSide) {
@@ -397,7 +515,10 @@ function buildEventText(
       lines.push(`Range ${formatPrice(min)}–${formatPrice(max)} · now ${formatPrice(price)}`);
     }
   }
-  lines.push(`Thresholds TP +${tpPct}% / SL -${slPct}%`);
+  lines.push(
+    `Thresholds ${formatThresholdSummary("tp", tpPct, tpPrice)} / ` +
+      `${formatThresholdSummary("sl", slPct, slPrice)}`,
+  );
   lines.push(`https://www.meteora.ag/dlmm/${detected.pool}`);
   return lines.join("\n");
 }
@@ -423,38 +544,65 @@ function rangeStatusLabel(row: LpSnapshotEntry): string {
   return "OUT of range";
 }
 
-function thresholdLabel(row: LpSnapshotEntry): string {
-  const parts: string[] = [];
-
-  if (row.tpPct > 0) {
-    if (row.pnlPct === null) parts.push(`TP +${row.tpPct}%`);
-    else if (row.pnlPct >= row.tpPct) parts.push(`TP +${row.tpPct}% (breached)`);
-    else parts.push(`TP +${row.tpPct}% (${(row.tpPct - row.pnlPct).toFixed(2)} pts away)`);
-  } else {
-    parts.push("TP off");
+export function thresholdBreached(
+  kind: ThresholdKind,
+  pct: number,
+  price: number | null,
+  row: Pick<LpSnapshotEntry, "pnlPct" | "activePrice">,
+): boolean {
+  if (price !== null && Number.isFinite(price) && price > 0) {
+    const active = positiveOrNull(row.activePrice);
+    if (active === null) return false;
+    return kind === "tp" ? active >= price : active <= price;
   }
-
-  if (row.slPct > 0) {
-    if (row.pnlPct === null) parts.push(`SL -${row.slPct}%`);
-    else if (row.pnlPct <= -row.slPct) parts.push(`SL -${row.slPct}% (breached)`);
-    else parts.push(`SL -${row.slPct}% (${(row.pnlPct + row.slPct).toFixed(2)} pts away)`);
-  } else {
-    parts.push("SL off");
-  }
-
-  return parts.join(" · ");
+  if (!(Number.isFinite(pct) && pct > 0) || row.pnlPct === null) return false;
+  return kind === "tp" ? row.pnlPct >= pct : row.pnlPct <= -pct;
 }
 
-export type ThresholdKind = "tp" | "sl";
+function thresholdLabel(row: LpSnapshotEntry): string {
+  return (
+    `${thresholdLabelFor(row, "tp", row.tpPct, row.tpPrice)} · ` +
+    `${thresholdLabelFor(row, "sl", row.slPct, row.slPrice)}`
+  );
+}
+
+function thresholdLabelFor(
+  row: LpSnapshotEntry,
+  kind: ThresholdKind,
+  pct: number,
+  price: number | null,
+): string {
+  const summary = formatThresholdSummary(kind, pct, price);
+
+  if (price !== null && Number.isFinite(price) && price > 0) {
+    if (thresholdBreached(kind, pct, price, row)) return `${summary} (breached)`;
+    const active = positiveOrNull(row.activePrice);
+    if (active === null) return summary;
+    const distance =
+      kind === "tp"
+        ? ((price - active) / active) * 100
+        : ((active - price) / active) * 100;
+    if (!Number.isFinite(distance)) return summary;
+    return `${summary} (${Math.abs(distance).toFixed(2)}% ${kind === "tp" ? "above" : "below"} now)`;
+  }
+
+  if (Number.isFinite(pct) && pct > 0) {
+    if (row.pnlPct === null) return summary;
+    if (kind === "tp") {
+      if (row.pnlPct >= pct) return `${summary} (breached)`;
+      return `${summary} (${(pct - row.pnlPct).toFixed(2)} pts away)`;
+    }
+    if (row.pnlPct <= -pct) return `${summary} (breached)`;
+    return `${summary} (${(row.pnlPct + pct).toFixed(2)} pts away)`;
+  }
+
+  return summary;
+}
 
 export interface ThresholdPriceEstimate {
   pnlPrice: number | null;
   rawPrice: number | null;
   breached: boolean;
-}
-
-function positiveOrNull(value: number | null): number | null {
-  return value !== null && Number.isFinite(value) && value > 0 ? value : null;
 }
 
 /**
@@ -510,11 +658,18 @@ export function formatThresholdHit(
   row: LpSnapshotEntry,
   kind: ThresholdKind,
   pct: number,
+  price: number | null = null,
 ): string | null {
+  const label = kind === "tp" ? "TP hit (expected)" : "SL hit (expected)";
+
+  if (price !== null && Number.isFinite(price) && price > 0) {
+    const state = thresholdBreached(kind, pct, price, row) ? " (breached now)" : "";
+    return `${label}: ${formatPrice(price)} (price target)${state}`;
+  }
+
   if (!(Number.isFinite(pct) && pct > 0)) return null;
 
   const estimate = estimateThresholdPrice(row, kind, pct);
-  const label = kind === "tp" ? "TP hit (expected)" : "SL hit (expected)";
   if (estimate.breached) return `${label}: breached now`;
 
   const pnlPart =
@@ -555,9 +710,9 @@ export function formatPositionStatus(row: LpSnapshotEntry): string {
 
   lines.push(`Age: ${age} · Fee/TVL 24h: ${feeTvl}`);
   lines.push(thresholdLabel(row));
-  const tpLine = formatThresholdHit(row, "tp", row.tpPct);
+  const tpLine = formatThresholdHit(row, "tp", row.tpPct, row.tpPrice);
   if (tpLine) lines.push(tpLine);
-  const slLine = formatThresholdHit(row, "sl", row.slPct);
+  const slLine = formatThresholdHit(row, "sl", row.slPct, row.slPrice);
   if (slLine) lines.push(slLine);
   lines.push(`https://www.meteora.ag/dlmm/${row.pool}`);
   return lines.join("\n");
@@ -634,8 +789,12 @@ export async function trackOnce(
   for (const detectedItem of ordered) {
     const { position: positionAddress, wallet } = detectedItem;
     const override = config.targets[positionAddress];
-    const tpPct = override?.tpPct ?? wallet.tpPct ?? config.defaultTpPct;
-    const slPct = override?.slPct ?? wallet.slPct ?? config.defaultSlPct;
+    const tp = resolveThreshold(override, wallet, config.defaultTpPct, "tp");
+    const sl = resolveThreshold(override, wallet, config.defaultSlPct, "sl");
+    const tpPct = tp.pct;
+    const slPct = sl.pct;
+    const tpPrice = tp.price;
+    const slPrice = sl.price;
 
     let entry = state[positionAddress];
     const isNew = !entry;
@@ -689,6 +848,8 @@ export async function trackOnce(
         feePerTvl24h: null,
         tpPct,
         slPct,
+        tpPrice,
+        slPrice,
         lastSeen: entry.lastSeen,
       });
       continue;
@@ -698,6 +859,7 @@ export async function trackOnce(
     const pnlUsd = num(pnl.pnlUsd);
     const balances = num(pnl.unrealizedPnl?.balances);
     const baseTokenUsd = numberOrNull(pnl.unrealizedPnl?.balanceTokenX.usd);
+    const activePrice = positiveOrNull(numberOrNull(pnl.poolActivePrice));
     const deposit = num(pnl.allTimeDeposits.total.usd);
     const fees = num(pnl.allTimeFees.total.usd);
     const unclaimedFeesUsd = pnl.unrealizedPnl
@@ -732,11 +894,13 @@ export async function trackOnce(
       upperBinId: pnl.upperBinId,
       minPrice: numberOrNull(pnl.minPrice),
       maxPrice: numberOrNull(pnl.maxPrice),
-      activePrice: numberOrNull(pnl.poolActivePrice),
+      activePrice,
       createdAt: pnl.createdAt ?? null,
       feePerTvl24h: numberOrNull(pnl.feePerTvl24h),
       tpPct,
       slPct,
+      tpPrice,
+      slPrice,
       lastSeen: entry.lastSeen,
     });
 
@@ -748,8 +912,18 @@ export async function trackOnce(
     entry.nearSide = detectedNearSide;
 
     const triggered: LpEventType[] = [];
-    if (tpPct > 0 && pnlPct >= tpPct) triggered.push("tp");
-    if (slPct > 0 && pnlPct <= -slPct) triggered.push("sl");
+    if (
+      (tpPrice !== null && activePrice !== null && activePrice >= tpPrice) ||
+      (tpPct > 0 && pnlPct >= tpPct)
+    ) {
+      triggered.push("tp");
+    }
+    if (
+      (slPrice !== null && activePrice !== null && activePrice <= slPrice) ||
+      (slPct > 0 && pnlPct <= -slPct)
+    ) {
+      triggered.push("sl");
+    }
     if (!isNew && !wasOutOfRange && range.outOfRange) triggered.push("oor");
     if (
       detectedNearSide &&
@@ -759,6 +933,16 @@ export async function trackOnce(
       triggered.push("near");
     }
 
+    const baseShareUsd = positiveOrNull(baseTokenUsd);
+    const totalUsd = positiveOrNull(balances);
+    const halfShare =
+      baseShareUsd !== null && totalUsd !== null && totalUsd > 0
+        ? (baseShareUsd / totalUsd) * 100
+        : null;
+    if (halfShare !== null && halfShare >= HALF_CONVERSION_PCT) {
+      triggered.push("half");
+    }
+
     for (const type of triggered) {
       const text = buildEventText(
         type,
@@ -766,7 +950,10 @@ export async function trackOnce(
         pnl,
         tpPct,
         slPct,
+        tpPrice,
+        slPrice,
         type === "near" ? detectedNearSide : null,
+        type === "half" ? halfShare : null,
       );
       const event: LpEvent = {
         type,
