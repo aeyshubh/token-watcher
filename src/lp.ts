@@ -953,7 +953,7 @@ export async function trackOnce(
       baseShareUsd !== null && totalUsd !== null && totalUsd > 0
         ? (baseShareUsd / totalUsd) * 100
         : null;
-    if (halfShare !== null && halfShare >= HALF_CONVERSION_PCT) {
+    if (halfShare !== null && halfShare >= HALF_CONVERSION_PCT && !range.outOfRange) {
       triggered.push("half");
     }
 

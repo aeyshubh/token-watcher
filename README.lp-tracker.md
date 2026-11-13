@@ -176,6 +176,8 @@ A near-range warning (`⚠️ LP NEAR RANGE EDGE`) fires when the active price c
 
 Pools in `lp.blacklistedPools` are never detected, tracked, or alerted. State entries for blacklisted pools are removed on the next successful detection tick.
 
+The 50% conversion alert (`🔄 LP HALF CONVERTED`) fires when the base token is at least 50% of the position balance, but is suppressed while the position is out of range.
+
 Alerts repeat while the condition stays breached, at most once per cooldown window. TP/SL and out-of-range have independent cooldowns; near-range reuses `oorCooldownMs`.
 
 ## Status output
