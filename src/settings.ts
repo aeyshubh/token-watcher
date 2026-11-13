@@ -1,6 +1,7 @@
 import "dotenv/config";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { isBase58 } from "./solana";
 
 export interface LpSettings {
   enabled: boolean;
@@ -12,6 +13,7 @@ export interface LpSettings {
   oorCooldownMs: number;
   minPositionUsd: number;
   nearRangeWidthPct: number;
+  blacklistedPools: string[];
 }
 
 export interface ExecutorSettings {
@@ -45,8 +47,9 @@ const DEFAULTS: AppSettings = {
     defaultSlPct: 10,
     alertCooldownMs: 900000,
     oorCooldownMs: 3600000,
-    minPositionUsd: 1,
-    nearRangeWidthPct: 10,
+      minPositionUsd: 1,
+      nearRangeWidthPct: 10,
+      blacklistedPools: [],
   },
   executor: {
     enabled: true,
@@ -119,6 +122,28 @@ function num(
   return n;
 }
 
+function strArray(value: unknown, name: string, fallback: string[]): string[] {
+  if (value === undefined || value === null) return fallback;
+  if (!Array.isArray(value)) {
+    throw new Error(`${SETTINGS_PATH}: "${name}" must be an array of strings`);
+  }
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const item of value) {
+    if (typeof item !== "string") {
+      throw new Error(`${SETTINGS_PATH}: "${name}" items must be strings`);
+    }
+    const v = item.trim();
+    if (!v || !isBase58(v)) {
+      throw new Error(`${SETTINGS_PATH}: "${name}" must contain valid base58 addresses`);
+    }
+    if (seen.has(v)) continue;
+    seen.add(v);
+    out.push(v);
+  }
+  return out;
+}
+
 export function loadSettings(): AppSettings {
   const root = readRoot();
   const lp = section(root, "lp");
@@ -166,6 +191,7 @@ export function loadSettings(): AppSettings {
         DEFAULTS.lp.nearRangeWidthPct,
         { min: 0, max: 100, allowZero: true },
       ),
+      blacklistedPools: strArray(lp.blacklistedPools, "lp.blacklistedPools", []),
     },
     executor: {
       enabled: bool(executor.enabled, "executor.enabled", DEFAULTS.executor.enabled),

@@ -10,7 +10,8 @@
     "alertCooldownMs": 900000,
     "oorCooldownMs": 3600000,
     "minPositionUsd": 1,
-    "nearRangeWidthPct": 10
+    "nearRangeWidthPct": 10,
+    "blacklistedPools": ["9jEuRVXfrirDvKzw9gs3aTBiGeDvLJmeyG3gDdWzMxEx"]
   },
   "executor": {
     "enabled": true,

@@ -42,10 +42,11 @@ export interface LpConfig {
   defaultSlPct: number;
   alertCooldownMs: number;
   oorCooldownMs: number;
-  minPositionUsd: number;
-  nearRangeWidthPct: number;
-  wallets: LpWallet[];
-  targets: Record<string, LpTarget>;
+    minPositionUsd: number;
+    nearRangeWidthPct: number;
+    blacklistedPools: string[];
+    wallets: LpWallet[];
+    targets: Record<string, LpTarget>;
 }
 
 export interface LpSnapshotEntry {
@@ -363,6 +364,7 @@ export function loadLpConfig(
     oorCooldownMs: settings.lp.oorCooldownMs,
     minPositionUsd: settings.lp.minPositionUsd,
     nearRangeWidthPct: settings.lp.nearRangeWidthPct,
+    blacklistedPools: settings.lp.blacklistedPools,
     wallets: readLpWallets(),
     targets: readLpTargets(),
   };
@@ -381,11 +383,13 @@ async function detectPositions(
   const detected = new Map<string, DetectedPosition>();
   const errors: string[] = [];
   let complete = true;
+  const blacklistedPools = new Set(config.blacklistedPools);
 
   for (const wallet of config.wallets) {
     try {
       const portfolio = await fetchOpenPortfolio(wallet.address);
       for (const pool of portfolio.pools) {
+        if (blacklistedPools.has(pool.poolAddress)) continue;
         for (const position of pool.listPositions ?? []) {
           detected.set(position, {
             position,
@@ -748,6 +752,16 @@ export async function trackOnce(
     for (const [positionAddress, entry] of Object.entries(state)) {
       if (!detected.has(positionAddress) || !configuredWallets.has(entry.wallet)) {
         delete state[positionAddress];
+      }
+    }
+  }
+
+  if (config.blacklistedPools.length > 0) {
+    const blacklistedPools = new Set(config.blacklistedPools);
+    for (const [positionAddress, entry] of Object.entries(state)) {
+      if (blacklistedPools.has(entry.pool)) {
+        delete state[positionAddress];
+        log(`Removed blacklisted pool from state · ${short(positionAddress)} · ${entry.pool}`);
       }
     }
   }

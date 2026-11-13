@@ -82,7 +82,8 @@ Threshold resolution order per side: **per-position override → wallet override
     "alertCooldownMs": 900000,
     "oorCooldownMs": 3600000,
     "minPositionUsd": 1,
-    "nearRangeWidthPct": 10
+    "nearRangeWidthPct": 10,
+    "blacklistedPools": []
   },
   "executor": {
     "enabled": true,
@@ -172,6 +173,8 @@ https://www.meteora.ag/dlmm/<pool>
 Stop-loss uses `🛑 LP STOP LOSS` and out-of-range uses `⚠️ LP OUT OF RANGE` with a direction line (`price above range (100% quote)` or `price below range (100% base)`).
 
 A near-range warning (`⚠️ LP NEAR RANGE EDGE`) fires when the active price comes within `lp.nearRangeWidthPct` percent of the range **width** from an edge, before the position goes out of range. Set it to `0` to disable.
+
+Pools in `lp.blacklistedPools` are never detected, tracked, or alerted. State entries for blacklisted pools are removed on the next successful detection tick.
 
 Alerts repeat while the condition stays breached, at most once per cooldown window. TP/SL and out-of-range have independent cooldowns; near-range reuses `oorCooldownMs`.
 

@@ -44,6 +44,7 @@ Every `lp.intervalMs` (default 15s) the tracker calls Meteora's `/portfolio/open
 - Threshold resolution per side: **per-position override → wallet override → `config/app.json` defaults**. A price threshold replaces the percentage for that side.
 - **Out of range**: a position transitions to out-of-range.
 - **Near range edge**: price comes within `lp.nearRangeWidthPct` percent of the range width from an edge (before OOR). Set `0` to disable.
+- **Blacklisted pools**: pools listed in `lp.blacklistedPools` are never detected, tracked, or alerted.
 
 Each position is numbered (`#1`, `#2`, …) in `/lp`. Overrides are stored in `config/lp-targets.json`. All Meteora calls share a process-wide throttle capped at `lp.maxRps` (default 20; official limit is 30 RPS). Tracking uses the Data API only, so no Solana RPC calls are consumed.
 
@@ -99,7 +100,8 @@ JUPITER_API_KEY=your_jupiter_api_key_here   # required for auto-close swaps
     "alertCooldownMs": 900000,
     "oorCooldownMs": 3600000,
     "minPositionUsd": 1,
-    "nearRangeWidthPct": 10
+    "nearRangeWidthPct": 10,
+    "blacklistedPools": []
   },
   "executor": {
     "enabled": true,
